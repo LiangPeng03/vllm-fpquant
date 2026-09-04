@@ -307,6 +307,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "permute_and_scale_cols(Tensor A, Tensor perm, Tensor scale) -> Tensor");
   ops.impl("permute_and_scale_cols", torch::kCUDA,
            &permute_and_scale_cols);
+  ops.def(
+      "nvfp4_lss_quant_identity(Tensor A, Tensor global_scale) -> (Tensor, Tensor)");
+  ops.impl("nvfp4_lss_quant_identity", torch::kCUDA,
+           &nvfp4_lss_quant_identity);
 
   // gptq_marlin Optimized Quantized GEMM for GPTQ.
   ops.def(

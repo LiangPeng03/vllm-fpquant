@@ -1352,6 +1352,29 @@ def permute_and_scale_cols(
     return torch.ops._C.permute_and_scale_cols(a, perm, scale)
 
 
+if hasattr(torch.ops._C, "nvfp4_lss_quant_identity"):
+
+    @register_fake("_C::nvfp4_lss_quant_identity")
+    def _nvfp4_lss_quant_identity_fake(
+        a: torch.Tensor, global_scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, groups = a.shape[0], a.shape[1] // 16
+        return (
+            torch.empty((rows, a.shape[1] // 2), dtype=torch.uint8, device=a.device),
+            torch.empty(
+                (((rows + 127) // 128) * 128, ((groups + 3) // 4) * 4),
+                dtype=torch.float8_e4m3fn,
+                device=a.device,
+            ),
+        )
+
+
+def nvfp4_lss_quant_identity(
+    a: torch.Tensor, global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.nvfp4_lss_quant_identity(a, global_scale)
+
+
 # fp4
 def scaled_fp4_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor

@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <tuple>
 
 static constexpr int default_threads = 256;
 static constexpr int div_ceil(int a, int b) { return (a + b - 1) / b; }
@@ -169,4 +170,167 @@ torch::Tensor permute_and_scale_cols(torch::Tensor const& A,
         numel, size_k);
   }
   return D;
+}
+
+// The NADA/Ours deployment path has an identity Hadamard transform. This
+// operator implements its online LSS activation quantization in the same
+// row-major FP4/E4M3 layout consumed by the existing NVFP4 GEMM.
+//
+// One warp handles one consecutive group of 16 BF16 activations.  The first
+// kernel computes the unrounded LSS scale; PyTorch performs the E4M3
+// round-trip so its conversion semantics stay identical to exported weights.
+// The second kernel uses that rounded scale to pack the two E2M1 values per
+// byte. This is intentionally separate from Qutlass because no matrix
+// transform is required for Ours.
+__device__ __forceinline__ float fp4_round_magnitude(float x) {
+  if (x > 5.0f) {
+    return 6.0f;
+  }
+  if (x >= 3.5f) {
+    return 4.0f;
+  }
+  if (x >= 1.75f) {
+    return static_cast<float>(__float2int_rn(x));
+  }
+  return 0.5f * static_cast<float>(__float2int_rn(2.0f * x));
+}
+
+__device__ __forceinline__ uint8_t encode_fp4(float value) {
+  float magnitude = fp4_round_magnitude(fabsf(value));
+  int code;
+  if (magnitude == 0.0f) {
+    // Match pack_fp4_to_uint8's tie choice for zero (the negative-zero code).
+    code = 8;
+  } else if (magnitude == 0.5f) {
+    code = 1;
+  } else if (magnitude == 1.0f) {
+    code = 2;
+  } else if (magnitude == 1.5f) {
+    code = 3;
+  } else if (magnitude == 2.0f) {
+    code = 4;
+  } else if (magnitude == 3.0f) {
+    code = 5;
+  } else if (magnitude == 4.0f) {
+    code = 6;
+  } else {
+    code = 7;
+  }
+  return static_cast<uint8_t>(value < 0.0f ? code | 8 : code);
+}
+
+__global__ void nvfp4_lss_scales_kernel(
+    __nv_bfloat16 const* __restrict__ input, float* __restrict__ scales,
+    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
+  constexpr int warps_per_block = default_threads / 32;
+  int warp = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+  int64_t group_index =
+      static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
+  int64_t group_count = rows * groups_per_row;
+  if (group_index >= group_count) {
+    return;
+  }
+
+  int64_t row = group_index / groups_per_row;
+  int64_t group = group_index % groups_per_row;
+  float abs_x = 0.0f;
+  if (lane < 16) {
+    abs_x = fabsf(__bfloat162float(input[row * groups_per_row * 16 +
+                                         group * 16 + lane]));
+  }
+
+  float max_abs = abs_x;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+  }
+  float initial_scale = __shfl_sync(0xffffffff, max_abs, 0) / 6.0f;
+  float safe_initial_scale = initial_scale == 0.0f ? 1.0f : initial_scale;
+  float grid = lane < 16 ? fp4_round_magnitude(abs_x / safe_initial_scale)
+                         : 0.0f;
+  float numerator = abs_x * grid;
+  float denominator = grid * grid;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    numerator += __shfl_down_sync(0xffffffff, numerator, offset);
+    denominator += __shfl_down_sync(0xffffffff, denominator, offset);
+  }
+  if (lane == 0) {
+    // The reference keeps its original (zero) scale for an all-zero group;
+    // the post-E4M3 stage below then changes it to one.
+    scales[row * padded_groups_per_row + group] =
+        denominator == 0.0f ? initial_scale : numerator / denominator;
+  }
+}
+
+__global__ void nvfp4_lss_pack_kernel(
+    __nv_bfloat16 const* __restrict__ input,
+    float const* __restrict__ rounded_scales,
+    float const* __restrict__ global_scale, uint8_t* __restrict__ output,
+    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
+  constexpr int warps_per_block = default_threads / 32;
+  int warp = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+  int64_t group_index =
+      static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
+  int64_t group_count = rows * groups_per_row;
+  if (group_index >= group_count || lane >= 8) {
+    return;
+  }
+
+  int64_t row = group_index / groups_per_row;
+  int64_t group = group_index % groups_per_row;
+  float local_scale =
+      rounded_scales[row * padded_groups_per_row + group] / global_scale[0];
+  if (local_scale == 0.0f) {
+    local_scale = 1.0f;
+  }
+
+  int64_t input_offset = row * groups_per_row * 16 + group * 16 + lane * 2;
+  uint8_t lo = encode_fp4(__bfloat162float(input[input_offset]) / local_scale);
+  uint8_t hi =
+      encode_fp4(__bfloat162float(input[input_offset + 1]) / local_scale);
+  output[row * groups_per_row * 8 + group * 8 + lane] = lo | (hi << 4);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
+    torch::Tensor const& A, torch::Tensor const& global_scale) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
+  TORCH_CHECK(A.scalar_type() == at::kBFloat16, "A must be bfloat16");
+  TORCH_CHECK(A.is_contiguous() && A.dim() == 2 && A.size(1) % 16 == 0,
+              "A must be a contiguous [rows, cols] tensor with cols divisible by 16");
+  TORCH_CHECK(global_scale.scalar_type() == at::kFloat &&
+                  global_scale.is_contiguous() && global_scale.numel() == 1,
+              "global_scale must be a contiguous float32 scalar");
+  TORCH_CHECK(A.get_device() == global_scale.get_device(),
+              "A and global_scale must be on the same GPU");
+
+  int64_t rows = A.size(0);
+  int64_t groups_per_row = A.size(1) / 16;
+  int64_t padded_rows = ((rows + 127) / 128) * 128;
+  int64_t padded_groups_per_row = ((groups_per_row + 3) / 4) * 4;
+  auto options = A.options();
+  torch::Tensor raw_scales = torch::zeros(
+      {padded_rows, padded_groups_per_row}, options.dtype(at::kFloat));
+  torch::Tensor output = torch::empty(
+      {rows, A.size(1) / 2}, options.dtype(at::kByte));
+
+  int64_t group_count = rows * groups_per_row;
+  int blocks = static_cast<int>((group_count + 7) / 8);
+  auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
+  nvfp4_lss_scales_kernel<<<blocks, default_threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
+      raw_scales.mutable_data_ptr<float>(), rows, groups_per_row,
+      padded_groups_per_row);
+
+  // Preserve the E4M3 round-trip used by Quantizer.get_quantization_params.
+  torch::Tensor fp8_scales =
+      (raw_scales * global_scale).clamp(-448.0, 448.0).to(at::kFloat8_e4m3fn);
+  torch::Tensor rounded_scales = fp8_scales.to(at::kFloat);
+
+  nvfp4_lss_pack_kernel<<<blocks, default_threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
+      rounded_scales.const_data_ptr<float>(), global_scale.const_data_ptr<float>(),
+      output.mutable_data_ptr<uint8_t>(), rows, groups_per_row,
+      padded_groups_per_row);
+  return std::make_tuple(output, fp8_scales);
 }

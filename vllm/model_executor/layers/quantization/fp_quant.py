@@ -13,6 +13,7 @@ from vllm._custom_ops import (
     fusedQuantizeMx,
     fusedQuantizeNv,
     matmul_mxf4_bf16_tn,
+    nvfp4_lss_quant_identity,
     permute_and_scale_cols,
 )
 from vllm.model_executor.layers.linear import (
@@ -36,6 +37,7 @@ class FPQuantConfig(QuantizationConfig):
         hadamard_group_size: int = 32,
         forward_dtype: str = "mxfp4",
         forward_method: str = "abs_max",
+        lss_identity_transform: bool = False,
         pseudoquantization: bool = False,
         modules_to_not_convert: Optional[list[str]] = None,
     ) -> None:
@@ -43,17 +45,28 @@ class FPQuantConfig(QuantizationConfig):
         self.hadamard_group_size = hadamard_group_size
         self.forward_dtype = forward_dtype
         self.forward_method = forward_method
+        self.lss_identity_transform = lss_identity_transform
         self.pseudoquantization = pseudoquantization
         self.modules_to_not_convert = modules_to_not_convert
 
         if pseudoquantization:
             raise ValueError("Pseudoquantization is not supported for vLLM")
+        if forward_method == "lss" and (
+            forward_dtype != "nvfp4"
+            or hadamard_group_size != 16
+            or not lss_identity_transform
+        ):
+            raise ValueError(
+                "LSS runtime quantization currently supports only NVFP4, "
+                "group size 16, and an identity transform."
+            )
 
     def __repr__(self) -> str:
         return (
             f"FPQuantConfig(hadamard_group_size={self.hadamard_group_size}, "
             f"forward_dtype={self.forward_dtype}, "
             f"forward_method={self.forward_method}, "
+            f"lss_identity_transform={self.lss_identity_transform}, "
             f"pseudoquantization={self.pseudoquantization}, "
             f"modules_to_not_convert={self.modules_to_not_convert})"
         )
@@ -79,12 +92,14 @@ class FPQuantConfig(QuantizationConfig):
         hadamard_group_size = cls.get_from_keys(config, ["hadamard_group_size"])
         forward_dtype = cls.get_from_keys(config, ["forward_dtype"])
         forward_method = cls.get_from_keys(config, ["forward_method"])
+        lss_identity_transform = config.get("lss_identity_transform", False)
         pseudoquantization = cls.get_from_keys(config, ["pseudoquantization"])
         modules_to_not_convert = cls.get_from_keys(config, ["modules_to_not_convert"])
         return cls(
             hadamard_group_size,
             forward_dtype,
             forward_method,
+            lss_identity_transform,
             pseudoquantization,
             modules_to_not_convert,
         )
@@ -372,6 +387,30 @@ direct_register_custom_op(
 )
 
 
+def nvfp4_lss_quant_identity_fake(x_flat, global_scale):
+    rows, groups = x_flat.size(0), x_flat.size(1) // 16
+    return (
+        torch.empty(
+            rows, x_flat.size(1) // 2, dtype=torch.uint8, device=x_flat.device
+        ),
+        torch.empty(
+            ((rows + 127) // 128) * 128,
+            ((groups + 3) // 4) * 4,
+            dtype=torch.float8_e4m3fn,
+            device=x_flat.device,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="nvfp4_lss_quant_identity",
+    op_func=nvfp4_lss_quant_identity,
+    mutates_args=[],
+    fake_impl=nvfp4_lss_quant_identity_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
 def matmul_nvf4_bf16(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -431,9 +470,16 @@ def quantized_forward(
             1 / (weight_global_scale * act_global_scale),
         )
     elif forward_dtype == "nvfp4":
-        x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_nv(
-            x_flat, forward_hadamard_matrix, act_global_scale
-        )
+        if forward_method == "abs_max":
+            x_flat_q, x_flat_scales = torch.ops.vllm.fused_quantize_nv(
+                x_flat, forward_hadamard_matrix, act_global_scale
+            )
+        elif forward_method == "lss":
+            x_flat_q, x_flat_scales = torch.ops.vllm.nvfp4_lss_quant_identity(
+                x_flat, act_global_scale
+            )
+        else:
+            raise ValueError(f"Unsupported NVFP4 forward_method: {forward_method}")
         y = torch.ops.vllm.matmul_nvf4_bf16(
             x_flat_q,
             qweight,
