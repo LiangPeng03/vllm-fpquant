@@ -437,6 +437,14 @@ class Qwen2Model(nn.Module):
                     if name is None:
                         continue
                 param = params_dict[name]
+                if name.endswith((".input_perm", ".input_rescale")):
+                    # These are whole input-channel vectors, shared by every
+                    # fused output shard. Do not send them through QKV /
+                    # merged-column shard loaders.
+                    module_name, _ = name.rsplit(".", 1)
+                    self.get_submodule(module_name).input_transform_enabled = True
+                    default_weight_loader(param, loaded_weight)
+                    break
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if weight_loader == default_weight_loader:
                     weight_loader(param, loaded_weight)
@@ -457,6 +465,29 @@ class Qwen2Model(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
+
+        # Run once after all tensors are loaded, outside torch.compile. This
+        # covers fused QKV/gate-up loaders that bypass the per-tensor hook.
+        for module in self.modules():
+            if not (
+                hasattr(module, "input_perm")
+                and hasattr(module, "input_rescale")
+                and hasattr(module, "input_transform_enabled")
+            ):
+                continue
+            identity_perm = torch.arange(
+                module.input_perm.numel(),
+                device=module.input_perm.device,
+                dtype=module.input_perm.dtype,
+            )
+            module.input_transform_enabled = not (
+                torch.equal(module.input_perm, identity_perm)
+                and torch.equal(
+                    module.input_rescale,
+                    torch.ones_like(module.input_rescale),
+                )
+            )
+
         return loaded_params
 
 

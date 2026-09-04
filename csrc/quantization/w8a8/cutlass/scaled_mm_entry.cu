@@ -41,7 +41,8 @@ void cutlass_moe_mm_sm90(
 
 #endif
 
-#if defined ENABLE_CUTLASS_MOE_SM100 && ENABLE_CUTLASS_MOE_SM100
+#if 0  // Disabled: SM100 MoE implementation is not linked in this SM120-only build.
+       // Qwen3-8B is a dense model and does not use this path.
 void cutlass_moe_mm_sm100(
     torch::Tensor& out_tensors, torch::Tensor const& a_tensors,
     torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
@@ -253,7 +254,8 @@ void cutlass_moe_mm(
     torch::Tensor const& b_strides, torch::Tensor const& c_strides,
     bool per_act_token, bool per_out_ch) {
   int32_t version_num = get_sm_version_num();
-#if defined ENABLE_CUTLASS_MOE_SM100 && ENABLE_CUTLASS_MOE_SM100
+#if 0  // Disabled: SM100 MoE implementation is not linked in this SM120-only build.
+       // Qwen3-8B is a dense model and does not use this path.
   if (version_num >= 100 && version_num < 110) {
     cutlass_moe_mm_sm100(out_tensors, a_tensors, b_tensors, a_scales, b_scales,
                          expert_offsets, problem_sizes, a_strides, b_strides,

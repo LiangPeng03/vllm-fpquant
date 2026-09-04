@@ -171,11 +171,25 @@ void runGemm(at::Tensor& D, at::Tensor const& A, at::Tensor const& B,
       torch::TensorOptions().dtype(torch::kUInt8).device(A.device());
   auto workspace = torch::empty(workspace_size, workspace_options);
 
-  CUTLASS_CHECK(gemm.can_implement(arguments));
+  auto status = gemm.can_implement(arguments);
+  TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "NVFP4 SM120 can_implement failed: ", cutlassGetStatusString(status),
+      " (M=", M, ", N=", N, ", K=", K,
+      "; A=", A.sizes(), ", B=", B.sizes(),
+      ", A_sf=", A_sf.sizes(), ", B_sf=", B_sf.sizes(), ")");
 
-  CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr(), stream));
+  status = gemm.initialize(arguments, workspace.data_ptr(), stream);
+  TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "NVFP4 SM120 initialize failed: ", cutlassGetStatusString(status),
+      " (M=", M, ", N=", N, ", K=", K, ")");
 
-  CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
+  status = gemm.run(arguments, workspace.data_ptr(), stream);
+  TORCH_CHECK(
+      status == cutlass::Status::kSuccess,
+      "NVFP4 SM120 run failed: ", cutlassGetStatusString(status),
+      " (M=", M, ", N=", N, ", K=", K, ")");
 }
 
 void cutlass_fp4_bf16_gemm_dispatch(torch::Tensor& D, torch::Tensor const& A,

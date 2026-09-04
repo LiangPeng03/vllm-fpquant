@@ -182,6 +182,7 @@ torch::Tensor awq_dequantize(torch::Tensor _kernel,
                              int64_t thx, int64_t thy);
 
 torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
+torch::Tensor permute_and_scale_cols(torch::Tensor const& A, torch::Tensor const& perm, torch::Tensor const& scale);
 #endif
 
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,

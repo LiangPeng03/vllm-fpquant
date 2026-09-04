@@ -13,6 +13,7 @@ from vllm._custom_ops import (
     fusedQuantizeMx,
     fusedQuantizeNv,
     matmul_mxf4_bf16_tn,
+    permute_and_scale_cols,
 )
 from vllm.model_executor.layers.linear import (
     LinearBase,
@@ -229,12 +230,42 @@ class FPQuantLinearMethod(LinearMethodBase):
         )
         layer.register_parameter("backward_hadamard_matrix", backward_hadamard_matrix)
 
+        # Optional Ours channel transform.  Normal FPQuant checkpoints omit
+        # these tensors, so identity/ones are safe defaults.
+        input_perm = Parameter(
+            torch.arange(input_size_per_partition, dtype=torch.long),
+            requires_grad=False,
+        )
+        set_weight_attrs(
+            input_perm, {"ignore_warning": True} | extra_weight_attrs
+        )
+        layer.register_parameter("input_perm", input_perm)
+
+        input_rescale = Parameter(
+            torch.ones(input_size_per_partition, dtype=params_dtype),
+            requires_grad=False,
+        )
+        set_weight_attrs(
+            input_rescale, {"ignore_warning": True} | extra_weight_attrs
+        )
+        layer.register_parameter("input_rescale", input_rescale)
+        # Set to True by Qwen2Model.load_weights only when a checkpoint
+        # actually contains input_perm/input_rescale.
+        layer.input_transform_enabled = False
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Set once by the model loader after checkpoint loading. Keep this
+        # hot path free of tensor-value tests so torch.compile/CUDA Graph can
+        # capture both legacy and Ours checkpoints.
+        if layer.input_transform_enabled:
+            x = permute_and_scale_cols(
+                x, layer.input_perm, layer.input_rescale
+            )
         return quantized_forward(
             x,
             layer.qweight,

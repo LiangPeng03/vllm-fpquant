@@ -303,6 +303,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
   ops.impl("permute_cols", torch::kCUDA, &permute_cols);
+  ops.def(
+      "permute_and_scale_cols(Tensor A, Tensor perm, Tensor scale) -> Tensor");
+  ops.impl("permute_and_scale_cols", torch::kCUDA,
+           &permute_and_scale_cols);
 
   // gptq_marlin Optimized Quantized GEMM for GPTQ.
   ops.def(

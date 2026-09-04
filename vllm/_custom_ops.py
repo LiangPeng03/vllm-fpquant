@@ -1337,6 +1337,21 @@ def permute_cols(a: torch.Tensor, perm: torch.Tensor) -> torch.Tensor:
     return torch.ops._C.permute_cols(a, perm)
 
 
+if hasattr(torch.ops._C, "permute_and_scale_cols"):
+
+    @register_fake("_C::permute_and_scale_cols")
+    def _permute_and_scale_cols_fake(
+        a: torch.Tensor, perm: torch.Tensor, scale: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.empty_like(a)
+
+
+def permute_and_scale_cols(
+    a: torch.Tensor, perm: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    return torch.ops._C.permute_and_scale_cols(a, perm, scale)
+
+
 # fp4
 def scaled_fp4_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor
