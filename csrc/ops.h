@@ -185,6 +185,9 @@ torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
 torch::Tensor permute_and_scale_cols(torch::Tensor const& A, torch::Tensor const& perm, torch::Tensor const& scale);
 std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
     torch::Tensor const& A, torch::Tensor const& global_scale);
+std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale(
+    torch::Tensor const& A, torch::Tensor const& perm,
+    torch::Tensor const& scale, torch::Tensor const& global_scale);
 #endif
 
 torch::Tensor ggml_dequantize(torch::Tensor W, int64_t type, int64_t m,

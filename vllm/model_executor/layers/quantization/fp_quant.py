@@ -16,6 +16,7 @@ from vllm._custom_ops import (
     fusedQuantizeNv,
     matmul_mxf4_bf16_tn,
     nvfp4_lss_quant_identity,
+    nvfp4_lss_quant_permute_scale,
     permute_and_scale_cols,
 )
 from vllm.model_executor.layers.linear import (
@@ -279,7 +280,14 @@ class FPQuantLinearMethod(LinearMethodBase):
         # Set once by the model loader after checkpoint loading. Keep this
         # hot path free of tensor-value tests so torch.compile/CUDA Graph can
         # capture both legacy and Ours checkpoints.
-        if layer.input_transform_enabled:
+        use_fused_lss_input_transform = (
+            layer.input_transform_enabled
+            and self.quant_config.forward_dtype == "nvfp4"
+            and self.quant_config.forward_method == "lss"
+            and self.quant_config.lss_identity_transform
+            and os.getenv("VLLM_FPQUANT_TORCH_REFERENCE", "0") != "1"
+        )
+        if layer.input_transform_enabled and not use_fused_lss_input_transform:
             x = permute_and_scale_cols(
                 x, layer.input_perm, layer.input_rescale
             )
@@ -318,6 +326,8 @@ class FPQuantLinearMethod(LinearMethodBase):
             layer.forward_hadamard_matrix,
             self.quant_config.forward_method,
             self.quant_config.forward_dtype,
+            layer.input_perm if use_fused_lss_input_transform else None,
+            layer.input_rescale if use_fused_lss_input_transform else None,
         )
 
 
@@ -536,11 +546,24 @@ def nvfp4_lss_quant_identity_fake(x_flat, global_scale):
     )
 
 
+def nvfp4_lss_quant_permute_scale_fake(x_flat, perm, scale, global_scale):
+    return nvfp4_lss_quant_identity_fake(x_flat, global_scale)
+
+
 direct_register_custom_op(
     op_name="nvfp4_lss_quant_identity",
     op_func=nvfp4_lss_quant_identity,
     mutates_args=[],
     fake_impl=nvfp4_lss_quant_identity_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
+direct_register_custom_op(
+    op_name="nvfp4_lss_quant_permute_scale",
+    op_func=nvfp4_lss_quant_permute_scale,
+    mutates_args=[],
+    fake_impl=nvfp4_lss_quant_permute_scale_fake,
     dispatch_key=current_platform.dispatch_key,
 )
 
@@ -589,6 +612,8 @@ def quantized_forward(
     forward_hadamard_matrix: torch.Tensor,
     forward_method: str,
     forward_dtype: str,
+    input_perm: Optional[torch.Tensor] = None,
+    input_rescale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     x_flat = x.contiguous().flatten(end_dim=-2)
 
@@ -609,9 +634,17 @@ def quantized_forward(
                 x_flat, forward_hadamard_matrix, act_global_scale
             )
         elif forward_method == "lss":
-            x_flat_q, x_flat_scales = torch.ops.vllm.nvfp4_lss_quant_identity(
-                x_flat, act_global_scale
-            )
+            if input_perm is None:
+                x_flat_q, x_flat_scales = torch.ops.vllm.nvfp4_lss_quant_identity(
+                    x_flat, act_global_scale
+                )
+            else:
+                assert input_rescale is not None
+                x_flat_q, x_flat_scales = (
+                    torch.ops.vllm.nvfp4_lss_quant_permute_scale(
+                        x_flat, input_perm, input_rescale, act_global_scale
+                    )
+                )
         else:
             raise ValueError(f"Unsupported NVFP4 forward_method: {forward_method}")
         y = torch.ops.vllm.matmul_nvf4_bf16(

@@ -313,6 +313,104 @@ __global__ void nvfp4_lss_pack_kernel(
   output[row * groups_per_row * 8 + group * 8 + lane] = lo | (hi << 4);
 }
 
+// This pair of kernels is numerically equivalent to
+// permute_and_scale_cols(A, perm, scale) followed by
+// nvfp4_lss_quant_identity(...).  It intentionally keeps the existing LSS
+// scale calculation, E4M3 round-trip, and FP4 packing unchanged, but avoids
+// materializing the transformed BF16 activation tensor.
+__global__ void nvfp4_lss_scales_permute_scale_kernel(
+    __nv_bfloat16 const* __restrict__ input,
+    int64_t const* __restrict__ perm,
+    __nv_bfloat16 const* __restrict__ scale,
+    __nv_bfloat16* __restrict__ scales,
+    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
+  constexpr int warps_per_block = default_threads / 32;
+  int warp = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+  int64_t group_index =
+      static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
+  int64_t group_count = rows * groups_per_row;
+  if (group_index >= group_count) {
+    return;
+  }
+
+  int64_t row = group_index / groups_per_row;
+  int64_t group = group_index % groups_per_row;
+  int64_t column = group * 16 + lane;
+  float abs_x = 0.0f;
+  if (lane < 16) {
+    __nv_bfloat16 transformed = multiply_scale(
+        input[row * groups_per_row * 16 + perm[column]], scale[column]);
+    abs_x = fabsf(__bfloat162float(transformed));
+  }
+
+  float max_abs = abs_x;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+  }
+  float initial_scale =
+      round_to_bf16(__shfl_sync(0xffffffff, max_abs, 0) / 6.0f);
+  float safe_initial_scale = initial_scale == 0.0f ? 1.0f : initial_scale;
+  float grid = lane < 16
+                   ? fp4_round_magnitude(
+                         round_to_bf16(abs_x / safe_initial_scale))
+                   : 0.0f;
+  float numerator = lane < 16 ? round_to_bf16(abs_x * grid) : 0.0f;
+  float denominator = lane < 16 ? round_to_bf16(grid * grid) : 0.0f;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    numerator += __shfl_down_sync(0xffffffff, numerator, offset);
+    denominator += __shfl_down_sync(0xffffffff, denominator, offset);
+  }
+  if (lane == 0) {
+    numerator = round_to_bf16(numerator);
+    denominator = round_to_bf16(denominator);
+    float lss_scale = denominator == 0.0f
+                          ? initial_scale
+                          : round_to_bf16(numerator / denominator);
+    scales[row * padded_groups_per_row + group] =
+        __float2bfloat16_rn(lss_scale);
+  }
+}
+
+__global__ void nvfp4_lss_pack_permute_scale_kernel(
+    __nv_bfloat16 const* __restrict__ input,
+    int64_t const* __restrict__ perm,
+    __nv_bfloat16 const* __restrict__ scale,
+    float const* __restrict__ rounded_scales,
+    float const* __restrict__ global_scale, uint8_t* __restrict__ output,
+    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
+  constexpr int warps_per_block = default_threads / 32;
+  int warp = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+  int64_t group_index =
+      static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
+  int64_t group_count = rows * groups_per_row;
+  if (group_index >= group_count || lane >= 8) {
+    return;
+  }
+
+  int64_t row = group_index / groups_per_row;
+  int64_t group = group_index % groups_per_row;
+  float local_scale =
+      rounded_scales[row * padded_groups_per_row + group] / global_scale[0];
+  local_scale = round_to_bf16(local_scale);
+  if (local_scale == 0.0f) {
+    local_scale = 1.0f;
+  }
+
+  int64_t column = group * 16 + lane * 2;
+  int64_t row_offset = row * groups_per_row * 16;
+  __nv_bfloat16 lo_input = multiply_scale(
+      input[row_offset + perm[column]], scale[column]);
+  __nv_bfloat16 hi_input = multiply_scale(
+      input[row_offset + perm[column + 1]], scale[column + 1]);
+  uint8_t lo = encode_fp4(round_to_bf16(
+      __bfloat162float(lo_input) / local_scale));
+  uint8_t hi = encode_fp4(round_to_bf16(
+      __bfloat162float(hi_input) / local_scale));
+  output[row * groups_per_row * 8 + group * 8 + lane] = lo | (hi << 4);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
     torch::Tensor const& A, torch::Tensor const& global_scale) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
@@ -350,6 +448,62 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
 
   nvfp4_lss_pack_kernel<<<blocks, default_threads, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
+      rounded_scales.const_data_ptr<float>(), global_scale.const_data_ptr<float>(),
+      output.mutable_data_ptr<uint8_t>(), rows, groups_per_row,
+      padded_groups_per_row);
+  return std::make_tuple(output, fp8_scales);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale(
+    torch::Tensor const& A, torch::Tensor const& perm,
+    torch::Tensor const& scale, torch::Tensor const& global_scale) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
+  TORCH_CHECK(A.scalar_type() == at::kBFloat16,
+              "A must be bfloat16");
+  TORCH_CHECK(A.is_contiguous() && A.dim() == 2 && A.size(1) % 16 == 0,
+              "A must be a contiguous [rows, cols] tensor with cols divisible by 16");
+  TORCH_CHECK(perm.scalar_type() == at::kLong && perm.is_contiguous() &&
+                  perm.dim() == 1 && perm.numel() == A.size(1),
+              "perm must be a contiguous int64 vector matching A columns");
+  TORCH_CHECK(scale.scalar_type() == at::kBFloat16 && scale.is_contiguous() &&
+                  scale.dim() == 1 && scale.numel() == A.size(1),
+              "scale must be a contiguous bfloat16 vector matching A columns");
+  TORCH_CHECK(global_scale.scalar_type() == at::kFloat &&
+                  global_scale.is_contiguous() && global_scale.numel() == 1,
+              "global_scale must be a contiguous float32 scalar");
+  TORCH_CHECK(A.get_device() == perm.get_device() &&
+                  A.get_device() == scale.get_device() &&
+                  A.get_device() == global_scale.get_device(),
+              "A, perm, scale, and global_scale must be on the same GPU");
+
+  int64_t rows = A.size(0);
+  int64_t groups_per_row = A.size(1) / 16;
+  int64_t padded_rows = ((rows + 127) / 128) * 128;
+  int64_t padded_groups_per_row = ((groups_per_row + 3) / 4) * 4;
+  auto options = A.options();
+  torch::Tensor raw_scales = torch::zeros(
+      {padded_rows, padded_groups_per_row}, options.dtype(at::kBFloat16));
+  torch::Tensor output = torch::empty(
+      {rows, A.size(1) / 2}, options.dtype(at::kByte));
+
+  int64_t group_count = rows * groups_per_row;
+  int blocks = static_cast<int>((group_count + 7) / 8);
+  auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
+  nvfp4_lss_scales_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
+      perm.const_data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(raw_scales.mutable_data_ptr()), rows,
+      groups_per_row, padded_groups_per_row);
+
+  torch::Tensor fp8_scales =
+      (raw_scales * global_scale).clamp(-448.0, 448.0).to(at::kFloat8_e4m3fn);
+  torch::Tensor rounded_scales = fp8_scales.to(at::kFloat);
+
+  nvfp4_lss_pack_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
+      perm.const_data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
       rounded_scales.const_data_ptr<float>(), global_scale.const_data_ptr<float>(),
       output.mutable_data_ptr<uint8_t>(), rows, groups_per_row,
       padded_groups_per_row);
