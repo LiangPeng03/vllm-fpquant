@@ -195,12 +195,21 @@ __device__ __forceinline__ float fp4_round_magnitude(float x) {
   return 0.5f * static_cast<float>(__float2int_rn(2.0f * x));
 }
 
+// The calibration-side Quantizer keeps NVFP4 LSS intermediates in BF16.
+// Round explicitly at each tensor-operation boundary so the online path uses
+// the same grid assignments and E4M3 scale inputs as pseudoquantization.
+__device__ __forceinline__ float round_to_bf16(float value) {
+  return __bfloat162float(__float2bfloat16_rn(value));
+}
+
 __device__ __forceinline__ uint8_t encode_fp4(float value) {
   float magnitude = fp4_round_magnitude(fabsf(value));
   int code;
   if (magnitude == 0.0f) {
-    // Match pack_fp4_to_uint8's tie choice for zero (the negative-zero code).
-    code = 8;
+    // Qutlass's activation quantizer stores both exact and rounded zeros as
+    // positive zero. Weight-export packing has a different signed-zero tie
+    // convention, so activation inputs must follow Qutlass here.
+    code = 0;
   } else if (magnitude == 0.5f) {
     code = 1;
   } else if (magnitude == 1.0f) {
@@ -220,7 +229,8 @@ __device__ __forceinline__ uint8_t encode_fp4(float value) {
 }
 
 __global__ void nvfp4_lss_scales_kernel(
-    __nv_bfloat16 const* __restrict__ input, float* __restrict__ scales,
+    __nv_bfloat16 const* __restrict__ input,
+    __nv_bfloat16* __restrict__ scales,
     int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
   constexpr int warps_per_block = default_threads / 32;
   int warp = threadIdx.x / 32;
@@ -244,12 +254,15 @@ __global__ void nvfp4_lss_scales_kernel(
   for (int offset = 16; offset > 0; offset /= 2) {
     max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
   }
-  float initial_scale = __shfl_sync(0xffffffff, max_abs, 0) / 6.0f;
+  float initial_scale =
+      round_to_bf16(__shfl_sync(0xffffffff, max_abs, 0) / 6.0f);
   float safe_initial_scale = initial_scale == 0.0f ? 1.0f : initial_scale;
-  float grid = lane < 16 ? fp4_round_magnitude(abs_x / safe_initial_scale)
-                         : 0.0f;
-  float numerator = abs_x * grid;
-  float denominator = grid * grid;
+  float grid = lane < 16
+                   ? fp4_round_magnitude(
+                         round_to_bf16(abs_x / safe_initial_scale))
+                   : 0.0f;
+  float numerator = lane < 16 ? round_to_bf16(abs_x * grid) : 0.0f;
+  float denominator = lane < 16 ? round_to_bf16(grid * grid) : 0.0f;
   for (int offset = 16; offset > 0; offset /= 2) {
     numerator += __shfl_down_sync(0xffffffff, numerator, offset);
     denominator += __shfl_down_sync(0xffffffff, denominator, offset);
@@ -257,8 +270,12 @@ __global__ void nvfp4_lss_scales_kernel(
   if (lane == 0) {
     // The reference keeps its original (zero) scale for an all-zero group;
     // the post-E4M3 stage below then changes it to one.
-    scales[row * padded_groups_per_row + group] =
-        denominator == 0.0f ? initial_scale : numerator / denominator;
+    numerator = round_to_bf16(numerator);
+    denominator = round_to_bf16(denominator);
+    float lss_scale = denominator == 0.0f
+                          ? initial_scale
+                          : round_to_bf16(numerator / denominator);
+    scales[row * padded_groups_per_row + group] = __float2bfloat16_rn(lss_scale);
   }
 }
 
@@ -281,14 +298,18 @@ __global__ void nvfp4_lss_pack_kernel(
   int64_t group = group_index % groups_per_row;
   float local_scale =
       rounded_scales[row * padded_groups_per_row + group] / global_scale[0];
+  local_scale = round_to_bf16(local_scale);
   if (local_scale == 0.0f) {
     local_scale = 1.0f;
   }
 
   int64_t input_offset = row * groups_per_row * 16 + group * 16 + lane * 2;
-  uint8_t lo = encode_fp4(__bfloat162float(input[input_offset]) / local_scale);
-  uint8_t hi =
-      encode_fp4(__bfloat162float(input[input_offset + 1]) / local_scale);
+  // Quantizer.quantize performs the activation/scale division in BF16 before
+  // cast_to_fp4. Preserve that rounding boundary before selecting an E2M1 bin.
+  uint8_t lo = encode_fp4(round_to_bf16(
+      __bfloat162float(input[input_offset]) / local_scale));
+  uint8_t hi = encode_fp4(round_to_bf16(
+      __bfloat162float(input[input_offset + 1]) / local_scale));
   output[row * groups_per_row * 8 + group * 8 + lane] = lo | (hi << 4);
 }
 
@@ -310,7 +331,7 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
   int64_t padded_groups_per_row = ((groups_per_row + 3) / 4) * 4;
   auto options = A.options();
   torch::Tensor raw_scales = torch::zeros(
-      {padded_rows, padded_groups_per_row}, options.dtype(at::kFloat));
+      {padded_rows, padded_groups_per_row}, options.dtype(at::kBFloat16));
   torch::Tensor output = torch::empty(
       {rows, A.size(1) / 2}, options.dtype(at::kByte));
 
@@ -319,7 +340,7 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
   auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
   nvfp4_lss_scales_kernel<<<blocks, default_threads, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
-      raw_scales.mutable_data_ptr<float>(), rows, groups_per_row,
+      reinterpret_cast<__nv_bfloat16*>(raw_scales.mutable_data_ptr()), rows, groups_per_row,
       padded_groups_per_row);
 
   // Preserve the E4M3 round-trip used by Quantizer.get_quantization_params.

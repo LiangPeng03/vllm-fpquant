@@ -167,7 +167,16 @@ class Qwen3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
-        rope_theta = getattr(config, "rope_theta", 1000000)
+        # Transformers 5.x can serialize the effective theta only in the new
+        # ``rope_parameters`` mapping while exposing a default-valued legacy
+        # ``rope_theta`` attribute. Prefer the explicitly serialized value.
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get(
+                "rope_theta", getattr(config, "rope_theta", 1000000)
+            )
+        else:
+            rope_theta = getattr(config, "rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None

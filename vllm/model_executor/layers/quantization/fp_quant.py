@@ -3,9 +3,11 @@
 
 # Supports FP-Quant compression, see https://arxiv.org/abs/2509.23202
 
+import os
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm._custom_ops import (
@@ -281,6 +283,31 @@ class FPQuantLinearMethod(LinearMethodBase):
             x = permute_and_scale_cols(
                 x, layer.input_perm, layer.input_rescale
             )
+        if os.getenv("VLLM_FPQUANT_TORCH_REFERENCE", "0") == "1":
+            if not (
+                self.quant_config.forward_dtype == "nvfp4"
+                and self.quant_config.forward_method == "lss"
+                and self.quant_config.lss_identity_transform
+            ):
+                raise ValueError(
+                    "VLLM_FPQUANT_TORCH_REFERENCE supports only NVFP4 LSS "
+                    "with an identity transform"
+                )
+            return _nvfp4_lss_torch_reference(
+                x,
+                layer.qweight,
+                layer.scales,
+                layer.weight_global_scale,
+                layer.act_global_scale,
+                bias,
+                (
+                    layer.output_partition_sizes
+                    if os.getenv(
+                        "VLLM_FPQUANT_TORCH_REFERENCE_SPLIT", "0"
+                    ) == "1"
+                    else None
+                ),
+            )
         return quantized_forward(
             x,
             layer.qweight,
@@ -292,6 +319,113 @@ class FPQuantLinearMethod(LinearMethodBase):
             self.quant_config.forward_method,
             self.quant_config.forward_dtype,
         )
+
+
+def _cast_to_fp4_values(x: torch.Tensor) -> torch.Tensor:
+    """Round to E2M1 values, matching the export-time pseudoquantizer."""
+    sign = torch.sign(x)
+    magnitude = x.abs()
+    rounded = torch.where(
+        magnitude > 5.0,
+        6.0,
+        torch.where(
+            magnitude >= 3.5,
+            4.0,
+            torch.where(
+                magnitude >= 1.75,
+                torch.round(magnitude),
+                torch.round(magnitude * 2.0) * 0.5,
+            ),
+        ),
+    )
+    return rounded * sign
+
+
+def _nvfp4_lss_quantize_reference(
+    x: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    original_shape = x.shape
+    grouped = x.reshape(-1, x.shape[-1] // 16, 16)
+    abs_x = grouped.abs()
+    absmax_scale = abs_x.amax(dim=-1, keepdim=True) / 6
+    safe_absmax_scale = torch.where(
+        absmax_scale == 0, torch.ones_like(absmax_scale), absmax_scale
+    )
+    grid = _cast_to_fp4_values(abs_x / safe_absmax_scale).abs()
+    numerator = (abs_x * grid).sum(dim=-1, keepdim=True)
+    denominator = (grid * grid).sum(dim=-1, keepdim=True)
+    safe_denominator = torch.where(
+        denominator == 0, torch.ones_like(denominator), denominator
+    )
+    scale = torch.where(
+        denominator == 0, absmax_scale, numerator / safe_denominator
+    )
+    scale = (
+        (scale * global_scale)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+        .to(torch.float32)
+        .div(global_scale)
+        .to(x.dtype)
+    )
+    safe_scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    quantized = _cast_to_fp4_values(grouped / safe_scale) * scale
+    return quantized.reshape(original_shape)
+
+
+def _nvfp4_lss_torch_reference(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    weight_global_scale: torch.Tensor,
+    act_global_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    output_splits: Optional[list[int]] = None,
+) -> torch.Tensor:
+    """Slow diagnostic path: decode NVFP4 weights and use BF16 F.linear."""
+    fp4_grid = torch.tensor(
+        [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+         0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=qweight.device,
+    )
+    packing_perm = torch.tensor(
+        [15, 14, 13, 12, 11, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7],
+        dtype=torch.long,
+        device=qweight.device,
+    )
+    codebook = torch.empty_like(fp4_grid)
+    codebook[packing_perm] = fp4_grid
+
+    output_features = qweight.shape[0]
+    input_features = qweight.shape[1] * 2
+    indices = torch.stack((qweight & 0xF, qweight >> 4), dim=-1)
+    decoded_weight = codebook[
+        indices.reshape(output_features, input_features).long()
+    ]
+    decoded_scales = (
+        weight_scales.view(torch.float8_e4m3fn).float()
+        / weight_global_scale
+    )
+    decoded_weight = (
+        decoded_weight * decoded_scales.repeat_interleave(16, dim=1)
+    ).to(torch.bfloat16)
+    quantized_x = _nvfp4_lss_quantize_reference(x, act_global_scale)
+    if output_splits is not None and len(output_splits) > 1:
+        weights = decoded_weight.split(output_splits, dim=0)
+        biases = (
+            bias.split(output_splits, dim=0)
+            if bias is not None
+            else [None] * len(output_splits)
+        )
+        return torch.cat(
+            [
+                F.linear(quantized_x, weight, split_bias)
+                for weight, split_bias in zip(weights, biases)
+            ],
+            dim=-1,
+        )
+    return F.linear(quantized_x, decoded_weight, bias)
 
 
 def ceil_div(a, b):
