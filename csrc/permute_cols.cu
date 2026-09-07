@@ -5,6 +5,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 #include <tuple>
@@ -177,11 +178,11 @@ torch::Tensor permute_and_scale_cols(torch::Tensor const& A,
 // row-major FP4/E4M3 layout consumed by the existing NVFP4 GEMM.
 //
 // One warp handles one consecutive group of 16 BF16 activations.  The first
-// kernel computes the unrounded LSS scale; PyTorch performs the E4M3
-// round-trip so its conversion semantics stay identical to exported weights.
-// The second kernel uses that rounded scale to pack the two E2M1 values per
-// byte. This is intentionally separate from Qutlass because no matrix
-// transform is required for Ours.
+// kernel computes the unrounded LSS scale and then applies the E4M3
+// round-trip in-register, matching the host-side clamp + cast semantics used
+// at export time. The second kernel uses that rounded scale to pack the two
+// E2M1 values per byte. This is intentionally separate from Qutlass because
+// no matrix transform is required for Ours.
 __device__ __forceinline__ float fp4_round_magnitude(float x) {
   if (x > 5.0f) {
     return 6.0f;
@@ -200,6 +201,22 @@ __device__ __forceinline__ float fp4_round_magnitude(float x) {
 // the same grid assignments and E4M3 scale inputs as pseudoquantization.
 __device__ __forceinline__ float round_to_bf16(float value) {
   return __bfloat162float(__float2bfloat16_rn(value));
+}
+
+// Replicates the host-side `(raw_scales * global_scale).clamp(-448, 448)
+// .to(at::kFloat8_e4m3fn)` round-trip in-register. The comparison-based
+// clamp (rather than fminf/fmaxf) propagates NaN exactly like torch.clamp;
+// __nv_cvt_float_to_fp8 with __NV_SATFINITE then rounds to nearest even,
+// matching c10's f32->e4m3fn conversion on the clamped range.
+__device__ __forceinline__ __nv_fp8_e4m3 to_fp8_e4m3(float value) {
+  float clamped =
+      value < -448.0f ? -448.0f : (value > 448.0f ? 448.0f : value);
+  return __nv_fp8_e4m3(clamped);
+}
+
+// E4M3 -> float is exact: every E4M3 value is representable in FP32.
+__device__ __forceinline__ float from_fp8_e4m3(__nv_fp8_e4m3 value) {
+  return static_cast<float>(value);
 }
 
 __device__ __forceinline__ uint8_t encode_fp4(float value) {
@@ -230,7 +247,8 @@ __device__ __forceinline__ uint8_t encode_fp4(float value) {
 
 __global__ void nvfp4_lss_scales_kernel(
     __nv_bfloat16 const* __restrict__ input,
-    __nv_bfloat16* __restrict__ scales,
+    __nv_fp8_e4m3* __restrict__ scales,
+    float const* __restrict__ global_scale,
     int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
   constexpr int warps_per_block = default_threads / 32;
   int warp = threadIdx.x / 32;
@@ -275,13 +293,14 @@ __global__ void nvfp4_lss_scales_kernel(
     float lss_scale = denominator == 0.0f
                           ? initial_scale
                           : round_to_bf16(numerator / denominator);
-    scales[row * padded_groups_per_row + group] = __float2bfloat16_rn(lss_scale);
+    scales[row * padded_groups_per_row + group] =
+        to_fp8_e4m3(lss_scale * global_scale[0]);
   }
 }
 
 __global__ void nvfp4_lss_pack_kernel(
     __nv_bfloat16 const* __restrict__ input,
-    float const* __restrict__ rounded_scales,
+    __nv_fp8_e4m3 const* __restrict__ fp8_scales,
     float const* __restrict__ global_scale, uint8_t* __restrict__ output,
     int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
   constexpr int warps_per_block = default_threads / 32;
@@ -297,7 +316,8 @@ __global__ void nvfp4_lss_pack_kernel(
   int64_t row = group_index / groups_per_row;
   int64_t group = group_index % groups_per_row;
   float local_scale =
-      rounded_scales[row * padded_groups_per_row + group] / global_scale[0];
+      from_fp8_e4m3(fp8_scales[row * padded_groups_per_row + group]) /
+      global_scale[0];
   local_scale = round_to_bf16(local_scale);
   if (local_scale == 0.0f) {
     local_scale = 1.0f;
@@ -316,13 +336,15 @@ __global__ void nvfp4_lss_pack_kernel(
 // This pair of kernels is numerically equivalent to
 // permute_and_scale_cols(A, perm, scale) followed by
 // nvfp4_lss_quant_identity(...).  It intentionally keeps the existing LSS
-// scale calculation, E4M3 round-trip, and FP4 packing unchanged, but avoids
-// materializing the transformed BF16 activation tensor.
+// scale calculation, E4M3 round-trip semantics, and FP4 packing unchanged,
+// but avoids materializing the transformed BF16 activation tensor and any
+// host-side elementwise scale casts.
 __global__ void nvfp4_lss_scales_permute_scale_kernel(
     __nv_bfloat16 const* __restrict__ input,
     int64_t const* __restrict__ perm,
     __nv_bfloat16 const* __restrict__ scale,
-    __nv_bfloat16* __restrict__ scales,
+    __nv_fp8_e4m3* __restrict__ scales,
+    float const* __restrict__ global_scale,
     int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
   constexpr int warps_per_block = default_threads / 32;
   int warp = threadIdx.x / 32;
@@ -368,7 +390,7 @@ __global__ void nvfp4_lss_scales_permute_scale_kernel(
                           ? initial_scale
                           : round_to_bf16(numerator / denominator);
     scales[row * padded_groups_per_row + group] =
-        __float2bfloat16_rn(lss_scale);
+        to_fp8_e4m3(lss_scale * global_scale[0]);
   }
 }
 
@@ -376,7 +398,7 @@ __global__ void nvfp4_lss_pack_permute_scale_kernel(
     __nv_bfloat16 const* __restrict__ input,
     int64_t const* __restrict__ perm,
     __nv_bfloat16 const* __restrict__ scale,
-    float const* __restrict__ rounded_scales,
+    __nv_fp8_e4m3 const* __restrict__ fp8_scales,
     float const* __restrict__ global_scale, uint8_t* __restrict__ output,
     int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
   constexpr int warps_per_block = default_threads / 32;
@@ -392,7 +414,8 @@ __global__ void nvfp4_lss_pack_permute_scale_kernel(
   int64_t row = group_index / groups_per_row;
   int64_t group = group_index % groups_per_row;
   float local_scale =
-      rounded_scales[row * padded_groups_per_row + group] / global_scale[0];
+      from_fp8_e4m3(fp8_scales[row * padded_groups_per_row + group]) /
+      global_scale[0];
   local_scale = round_to_bf16(local_scale);
   if (local_scale == 0.0f) {
     local_scale = 1.0f;
@@ -428,27 +451,27 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
   int64_t padded_rows = ((rows + 127) / 128) * 128;
   int64_t padded_groups_per_row = ((groups_per_row + 3) / 4) * 4;
   auto options = A.options();
-  torch::Tensor raw_scales = torch::zeros(
-      {padded_rows, padded_groups_per_row}, options.dtype(at::kBFloat16));
+  torch::Tensor fp8_scales = torch::zeros(
+      {padded_rows, padded_groups_per_row}, options.dtype(at::kFloat8_e4m3fn));
   torch::Tensor output = torch::empty(
       {rows, A.size(1) / 2}, options.dtype(at::kByte));
 
   int64_t group_count = rows * groups_per_row;
   int blocks = static_cast<int>((group_count + 7) / 8);
   auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
+  // The scales kernel applies the E4M3 round-trip used by
+  // Quantizer.get_quantization_params in-register, so no intermediate BF16
+  // scales tensor or host-side elementwise casts are needed.
   nvfp4_lss_scales_kernel<<<blocks, default_threads, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(raw_scales.mutable_data_ptr()), rows, groups_per_row,
+      reinterpret_cast<__nv_fp8_e4m3*>(fp8_scales.mutable_data_ptr()),
+      global_scale.const_data_ptr<float>(), rows, groups_per_row,
       padded_groups_per_row);
-
-  // Preserve the E4M3 round-trip used by Quantizer.get_quantization_params.
-  torch::Tensor fp8_scales =
-      (raw_scales * global_scale).clamp(-448.0, 448.0).to(at::kFloat8_e4m3fn);
-  torch::Tensor rounded_scales = fp8_scales.to(at::kFloat);
 
   nvfp4_lss_pack_kernel<<<blocks, default_threads, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
-      rounded_scales.const_data_ptr<float>(), global_scale.const_data_ptr<float>(),
+      reinterpret_cast<__nv_fp8_e4m3 const*>(fp8_scales.const_data_ptr()),
+      global_scale.const_data_ptr<float>(),
       output.mutable_data_ptr<uint8_t>(), rows, groups_per_row,
       padded_groups_per_row);
   return std::make_tuple(output, fp8_scales);
@@ -481,8 +504,8 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale(
   int64_t padded_rows = ((rows + 127) / 128) * 128;
   int64_t padded_groups_per_row = ((groups_per_row + 3) / 4) * 4;
   auto options = A.options();
-  torch::Tensor raw_scales = torch::zeros(
-      {padded_rows, padded_groups_per_row}, options.dtype(at::kBFloat16));
+  torch::Tensor fp8_scales = torch::zeros(
+      {padded_rows, padded_groups_per_row}, options.dtype(at::kFloat8_e4m3fn));
   torch::Tensor output = torch::empty(
       {rows, A.size(1) / 2}, options.dtype(at::kByte));
 
@@ -493,18 +516,16 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
       perm.const_data_ptr<int64_t>(),
       reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(raw_scales.mutable_data_ptr()), rows,
+      reinterpret_cast<__nv_fp8_e4m3*>(fp8_scales.mutable_data_ptr()),
+      global_scale.const_data_ptr<float>(), rows,
       groups_per_row, padded_groups_per_row);
-
-  torch::Tensor fp8_scales =
-      (raw_scales * global_scale).clamp(-448.0, 448.0).to(at::kFloat8_e4m3fn);
-  torch::Tensor rounded_scales = fp8_scales.to(at::kFloat);
 
   nvfp4_lss_pack_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
       perm.const_data_ptr<int64_t>(),
       reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
-      rounded_scales.const_data_ptr<float>(), global_scale.const_data_ptr<float>(),
+      reinterpret_cast<__nv_fp8_e4m3 const*>(fp8_scales.const_data_ptr()),
+      global_scale.const_data_ptr<float>(),
       output.mutable_data_ptr<uint8_t>(), rows, groups_per_row,
       padded_groups_per_row);
   return std::make_tuple(output, fp8_scales);
