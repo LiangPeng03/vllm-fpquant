@@ -345,7 +345,8 @@ __global__ void nvfp4_lss_scales_permute_scale_kernel(
     __nv_bfloat16 const* __restrict__ scale,
     __nv_fp8_e4m3* __restrict__ scales,
     float const* __restrict__ global_scale,
-    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
+    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row,
+    bool cutlass_scale_layout) {
   constexpr int warps_per_block = default_threads / 32;
   int warp = threadIdx.x / 32;
   int lane = threadIdx.x % 32;
@@ -389,8 +390,21 @@ __global__ void nvfp4_lss_scales_permute_scale_kernel(
     float lss_scale = denominator == 0.0f
                           ? initial_scale
                           : round_to_bf16(numerator / denominator);
-    scales[row * padded_groups_per_row + group] =
-        to_fp8_e4m3(lss_scale * global_scale[0]);
+    int64_t scale_index = row * padded_groups_per_row + group;
+    if (cutlass_scale_layout) {
+      // CUTLASS Blackwell NVFP4 scale-factor layout.  It is the same mapping
+      // as Four Over Six's CUDA quantizer and avoids a separate online
+      // row-major-to-blocked scale reorder.
+      int64_t block_row = row / 128;
+      int64_t block_col = group / 4;
+      int64_t row_in_block = row % 128;
+      int64_t scale_row =
+          32 * (block_row * (padded_groups_per_row / 4) + block_col) +
+          (row_in_block % 32);
+      int64_t scale_col = (row_in_block / 32) * 4 + (group % 4);
+      scale_index = scale_row * 16 + scale_col;
+    }
+    scales[scale_index] = to_fp8_e4m3(lss_scale * global_scale[0]);
   }
 }
 
@@ -400,7 +414,8 @@ __global__ void nvfp4_lss_pack_permute_scale_kernel(
     __nv_bfloat16 const* __restrict__ scale,
     __nv_fp8_e4m3 const* __restrict__ fp8_scales,
     float const* __restrict__ global_scale, uint8_t* __restrict__ output,
-    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
+    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row,
+    bool cutlass_scale_layout) {
   constexpr int warps_per_block = default_threads / 32;
   int warp = threadIdx.x / 32;
   int lane = threadIdx.x % 32;
@@ -413,9 +428,18 @@ __global__ void nvfp4_lss_pack_permute_scale_kernel(
 
   int64_t row = group_index / groups_per_row;
   int64_t group = group_index % groups_per_row;
-  float local_scale =
-      from_fp8_e4m3(fp8_scales[row * padded_groups_per_row + group]) /
-      global_scale[0];
+  int64_t scale_index = row * padded_groups_per_row + group;
+  if (cutlass_scale_layout) {
+    int64_t block_row = row / 128;
+    int64_t block_col = group / 4;
+    int64_t row_in_block = row % 128;
+    int64_t scale_row =
+        32 * (block_row * (padded_groups_per_row / 4) + block_col) +
+        (row_in_block % 32);
+    int64_t scale_col = (row_in_block / 32) * 4 + (group % 4);
+    scale_index = scale_row * 16 + scale_col;
+  }
+  float local_scale = from_fp8_e4m3(fp8_scales[scale_index]) / global_scale[0];
   local_scale = round_to_bf16(local_scale);
   if (local_scale == 0.0f) {
     local_scale = 1.0f;
@@ -518,7 +542,7 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale(
       reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
       reinterpret_cast<__nv_fp8_e4m3*>(fp8_scales.mutable_data_ptr()),
       global_scale.const_data_ptr<float>(), rows,
-      groups_per_row, padded_groups_per_row);
+      groups_per_row, padded_groups_per_row, false);
 
   nvfp4_lss_pack_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
@@ -527,6 +551,60 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale(
       reinterpret_cast<__nv_fp8_e4m3 const*>(fp8_scales.const_data_ptr()),
       global_scale.const_data_ptr<float>(),
       output.mutable_data_ptr<uint8_t>(), rows, groups_per_row,
-      padded_groups_per_row);
+      padded_groups_per_row, false);
+  return std::make_tuple(output, fp8_scales);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale_cutlass(
+    torch::Tensor const& A, torch::Tensor const& perm,
+    torch::Tensor const& scale, torch::Tensor const& global_scale) {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
+  TORCH_CHECK(A.scalar_type() == at::kBFloat16,
+              "A must be bfloat16");
+  TORCH_CHECK(A.is_contiguous() && A.dim() == 2 && A.size(1) % 64 == 0,
+              "A must be contiguous [rows, cols] with cols divisible by 64");
+  TORCH_CHECK(perm.scalar_type() == at::kLong && perm.is_contiguous() &&
+                  perm.dim() == 1 && perm.numel() == A.size(1),
+              "perm must be a contiguous int64 vector matching A columns");
+  TORCH_CHECK(scale.scalar_type() == at::kBFloat16 && scale.is_contiguous() &&
+                  scale.dim() == 1 && scale.numel() == A.size(1),
+              "scale must be a contiguous bfloat16 vector matching A columns");
+  TORCH_CHECK(global_scale.scalar_type() == at::kFloat &&
+                  global_scale.is_contiguous() && global_scale.numel() == 1,
+              "global_scale must be a contiguous float32 scalar");
+  TORCH_CHECK(A.get_device() == perm.get_device() &&
+                  A.get_device() == scale.get_device() &&
+                  A.get_device() == global_scale.get_device(),
+              "A, perm, scale, and global_scale must be on the same GPU");
+
+  int64_t rows = A.size(0);
+  int64_t groups_per_row = A.size(1) / 16;
+  int64_t padded_rows = ((rows + 127) / 128) * 128;
+  int64_t padded_groups_per_row = ((groups_per_row + 3) / 4) * 4;
+  auto options = A.options();
+  // Both buffers already use the layout expected by the SM120 CUTLASS GEMM.
+  torch::Tensor fp8_scales = torch::zeros(
+      {padded_rows * padded_groups_per_row},
+      options.dtype(at::kFloat8_e4m3fn));
+  torch::Tensor output = torch::zeros(
+      {padded_rows, A.size(1) / 2}, options.dtype(at::kByte));
+
+  int64_t group_count = rows * groups_per_row;
+  int blocks = static_cast<int>((group_count + 7) / 8);
+  auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
+  nvfp4_lss_scales_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
+      perm.const_data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
+      reinterpret_cast<__nv_fp8_e4m3*>(fp8_scales.mutable_data_ptr()),
+      global_scale.const_data_ptr<float>(), rows, groups_per_row,
+      padded_groups_per_row, true);
+  nvfp4_lss_pack_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
+      perm.const_data_ptr<int64_t>(),
+      reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
+      reinterpret_cast<__nv_fp8_e4m3 const*>(fp8_scales.const_data_ptr()),
+      global_scale.const_data_ptr<float>(), output.mutable_data_ptr<uint8_t>(),
+      rows, groups_per_row, padded_groups_per_row, true);
   return std::make_tuple(output, fp8_scales);
 }

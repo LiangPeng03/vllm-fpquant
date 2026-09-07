@@ -1404,6 +1404,40 @@ def nvfp4_lss_quant_permute_scale(
     return torch.ops._C.nvfp4_lss_quant_permute_scale(a, perm, scale, global_scale)
 
 
+if hasattr(torch.ops._C, "nvfp4_lss_quant_permute_scale_cutlass"):
+
+    @register_fake("_C::nvfp4_lss_quant_permute_scale_cutlass")
+    def _nvfp4_lss_quant_permute_scale_cutlass_fake(
+        a: torch.Tensor,
+        perm: torch.Tensor,
+        scale: torch.Tensor,
+        global_scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        padded_rows = ((a.shape[0] + 127) // 128) * 128
+        padded_groups = ((a.shape[1] // 16 + 3) // 4) * 4
+        return (
+            torch.empty(
+                (padded_rows, a.shape[1] // 2), dtype=torch.uint8, device=a.device
+            ),
+            torch.empty(
+                (padded_rows * padded_groups,),
+                dtype=torch.float8_e4m3fn,
+                device=a.device,
+            ),
+        )
+
+
+def nvfp4_lss_quant_permute_scale_cutlass(
+    a: torch.Tensor,
+    perm: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C.nvfp4_lss_quant_permute_scale_cutlass(
+        a, perm, scale, global_scale
+    )
+
+
 # fp4
 def scaled_fp4_quant(
     input: torch.Tensor, input_global_scale: torch.Tensor
