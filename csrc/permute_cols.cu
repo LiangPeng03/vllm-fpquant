@@ -458,6 +458,104 @@ __global__ void nvfp4_lss_pack_permute_scale_kernel(
   output[row * groups_per_row * 8 + group * 8 + lane] = lo | (hi << 4);
 }
 
+// Specialized deployment kernel for the NADA + CUTLASS path.  Unlike the
+// generic path above, CUTLASS consumes the padded FP4 values and swizzled
+// E4M3 scales directly.  Each warp can therefore compute the LSS scale,
+// perform its E4M3 round-trip, and pack its 16 values without writing and
+// re-reading an intermediate scale tensor.
+__global__ void nvfp4_lss_quant_permute_scale_cutlass_fused_kernel(
+    __nv_bfloat16 const* __restrict__ input,
+    int32_t const* __restrict__ perm,
+    __nv_bfloat16 const* __restrict__ scale,
+    __nv_fp8_e4m3* __restrict__ fp8_scales,
+    float const* __restrict__ global_scale, uint8_t* __restrict__ output,
+    int64_t rows, int64_t groups_per_row, int64_t padded_groups_per_row) {
+  constexpr int warps_per_block = default_threads / 32;
+  int warp = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+  int64_t group_index =
+      static_cast<int64_t>(blockIdx.x) * warps_per_block + warp;
+  int64_t group_count = rows * groups_per_row;
+  if (group_index >= group_count) {
+    return;
+  }
+
+  int64_t row = group_index / groups_per_row;
+  int64_t group = group_index % groups_per_row;
+  int64_t row_offset = row * groups_per_row * 16;
+  int64_t column = group * 16 + lane;
+  float abs_x = 0.0f;
+  // Retain the already BF16-rounded transformed value in registers. The
+  // previous two-kernel implementation loaded it once for scale estimation
+  // and once again for packing.
+  float transformed_value = 0.0f;
+  if (lane < 16) {
+    __nv_bfloat16 transformed = multiply_scale(
+        input[row_offset + perm[column]], scale[column]);
+    transformed_value = __bfloat162float(transformed);
+    abs_x = fabsf(transformed_value);
+  }
+
+  float max_abs = abs_x;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    max_abs = fmaxf(max_abs, __shfl_down_sync(0xffffffff, max_abs, offset));
+  }
+  float initial_scale =
+      round_to_bf16(__shfl_sync(0xffffffff, max_abs, 0) / 6.0f);
+  float safe_initial_scale = initial_scale == 0.0f ? 1.0f : initial_scale;
+  float grid = lane < 16
+                   ? fp4_round_magnitude(
+                         round_to_bf16(abs_x / safe_initial_scale))
+                   : 0.0f;
+  float numerator = lane < 16 ? round_to_bf16(abs_x * grid) : 0.0f;
+  float denominator = lane < 16 ? round_to_bf16(grid * grid) : 0.0f;
+  for (int offset = 16; offset > 0; offset /= 2) {
+    numerator += __shfl_down_sync(0xffffffff, numerator, offset);
+    denominator += __shfl_down_sync(0xffffffff, denominator, offset);
+  }
+
+  float local_scale = 1.0f;
+  __nv_fp8_e4m3 fp8_scale;
+  if (lane == 0) {
+    numerator = round_to_bf16(numerator);
+    denominator = round_to_bf16(denominator);
+    float lss_scale = denominator == 0.0f
+                          ? initial_scale
+                          : round_to_bf16(numerator / denominator);
+    fp8_scale = to_fp8_e4m3(lss_scale * global_scale[0]);
+    local_scale = round_to_bf16(from_fp8_e4m3(fp8_scale) / global_scale[0]);
+    if (local_scale == 0.0f) {
+      local_scale = 1.0f;
+    }
+
+    int64_t block_row = row / 128;
+    int64_t block_col = group / 4;
+    int64_t row_in_block = row % 128;
+    int64_t scale_row =
+        32 * (block_row * (padded_groups_per_row / 4) + block_col) +
+        (row_in_block % 32);
+    int64_t scale_col = (row_in_block / 32) * 4 + (group % 4);
+    fp8_scales[scale_row * 16 + scale_col] = fp8_scale;
+  }
+  local_scale = __shfl_sync(0xffffffff, local_scale, 0);
+
+  // Every lane named by the full-warp mask must execute both shuffles.  Only
+  // lanes 0--7 consume the pair, so inactive consumers use lane 0 as a valid
+  // harmless source.
+  int source_lane = lane < 8 ? lane * 2 : 0;
+  float lo_input =
+      __shfl_sync(0xffffffff, transformed_value, source_lane);
+  float hi_input =
+      __shfl_sync(0xffffffff, transformed_value, source_lane + 1);
+  if (lane < 8) {
+    uint8_t lo = encode_fp4(round_to_bf16(
+        lo_input / local_scale));
+    uint8_t hi = encode_fp4(round_to_bf16(
+        hi_input / local_scale));
+    output[row * groups_per_row * 8 + group * 8 + lane] = lo | (hi << 4);
+  }
+}
+
 std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_identity(
     torch::Tensor const& A, torch::Tensor const& global_scale) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
@@ -563,9 +661,9 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale_cutlass(
               "A must be bfloat16");
   TORCH_CHECK(A.is_contiguous() && A.dim() == 2 && A.size(1) % 64 == 0,
               "A must be contiguous [rows, cols] with cols divisible by 64");
-  TORCH_CHECK(perm.scalar_type() == at::kLong && perm.is_contiguous() &&
+  TORCH_CHECK(perm.scalar_type() == at::kInt && perm.is_contiguous() &&
                   perm.dim() == 1 && perm.numel() == A.size(1),
-              "perm must be a contiguous int64 vector matching A columns");
+              "perm must be a contiguous int32 vector matching A columns");
   TORCH_CHECK(scale.scalar_type() == at::kBFloat16 && scale.is_contiguous() &&
                   scale.dim() == 1 && scale.numel() == A.size(1),
               "scale must be a contiguous bfloat16 vector matching A columns");
@@ -583,28 +681,26 @@ std::tuple<torch::Tensor, torch::Tensor> nvfp4_lss_quant_permute_scale_cutlass(
   int64_t padded_groups_per_row = ((groups_per_row + 3) / 4) * 4;
   auto options = A.options();
   // Both buffers already use the layout expected by the SM120 CUTLASS GEMM.
-  torch::Tensor fp8_scales = torch::zeros(
+  // CUTLASS receives the unpadded logical M dimension through QuantizedTensor
+  // and never reads the tail rows. The fused kernel writes every valid scale
+  // and FP4 byte, so clearing the padded tail would only add two launches on
+  // the decode critical path.
+  torch::Tensor fp8_scales = torch::empty(
       {padded_rows * padded_groups_per_row},
       options.dtype(at::kFloat8_e4m3fn));
-  torch::Tensor output = torch::zeros(
+  torch::Tensor output = torch::empty(
       {padded_rows, A.size(1) / 2}, options.dtype(at::kByte));
 
   int64_t group_count = rows * groups_per_row;
   int blocks = static_cast<int>((group_count + 7) / 8);
   auto stream = at::cuda::getCurrentCUDAStream(A.get_device());
-  nvfp4_lss_scales_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
+  nvfp4_lss_quant_permute_scale_cutlass_fused_kernel<<<
+      blocks, default_threads, 0, stream>>>(
       reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
-      perm.const_data_ptr<int64_t>(),
+      perm.const_data_ptr<int32_t>(),
       reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
       reinterpret_cast<__nv_fp8_e4m3*>(fp8_scales.mutable_data_ptr()),
-      global_scale.const_data_ptr<float>(), rows, groups_per_row,
-      padded_groups_per_row, true);
-  nvfp4_lss_pack_permute_scale_kernel<<<blocks, default_threads, 0, stream>>>(
-      reinterpret_cast<__nv_bfloat16 const*>(A.const_data_ptr()),
-      perm.const_data_ptr<int64_t>(),
-      reinterpret_cast<__nv_bfloat16 const*>(scale.const_data_ptr()),
-      reinterpret_cast<__nv_fp8_e4m3 const*>(fp8_scales.const_data_ptr()),
       global_scale.const_data_ptr<float>(), output.mutable_data_ptr<uint8_t>(),
-      rows, groups_per_row, padded_groups_per_row, true);
+      rows, groups_per_row, padded_groups_per_row);
   return std::make_tuple(output, fp8_scales);
 }
