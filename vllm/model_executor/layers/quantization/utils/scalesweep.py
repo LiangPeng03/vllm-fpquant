@@ -77,8 +77,8 @@ def _quantize(
     fp32 = ((scale_exp + 120) << 23) | (scale_man << 20)
     decoded = tl.where(scale_exp > 0, fp32.to(tl.float32, bitcast=True),
                        scale_man.to(tl.float32) / 512.0)
-    physical = decoded / inverse
-    reconstructed = _fp4(values[:, :, None] / physical[:, None, :]) * physical[:, None, :]
+    physical = tl.div_rn(decoded, inverse)
+    reconstructed = _fp4(tl.div_rn(values[:, :, None], physical[:, None, :])) * physical[:, None, :]
     error = reconstructed - values[:, :, None]
     error = error * error
     if WEIGHTED:
@@ -95,7 +95,7 @@ def _quantize(
     selected_scale = tl.sum(
         tl.where(candidate[None, :] == winner[:, None], physical, 0.0), axis=1
     )
-    pairs = tl.reshape(values / selected_scale[:, None], (BLOCKS, 8, 2))
+    pairs = tl.reshape(tl.div_rn(values, selected_scale[:, None]), (BLOCKS, 8, 2))
     component = tl.arange(0, 2)
     low = tl.sum(tl.where(component[None, None, :] == 0, pairs, 0), axis=2)
     high = tl.sum(tl.where(component[None, None, :] == 1, pairs, 0), axis=2)
@@ -192,6 +192,44 @@ def reference_quantize(x, global_scale, importance=None):
     return packed, scales, reconstructed
 
 
+def _report_mismatch(x, global_scale, importance, actual, scales, expected, expected_scales):
+    packed_mask = actual != expected
+    scale_mask = scales.view(torch.uint8) != expected_scales.view(torch.uint8)
+    print(
+        f"ScaleSweep mismatch: packed_bytes={packed_mask.sum().item()} "
+        f"fp8_scales={scale_mask.sum().item()}",
+        flush=True,
+    )
+    for row, byte in packed_mask.nonzero()[:4].tolist():
+        group = byte // 8
+        first_column = group * 16
+        values = x[row, first_column:first_column + 16].float()
+        left = scales[row, group].float() / global_scale
+        right = expected_scales[row, group].float() / global_scale
+        weights = (
+            importance[first_column:first_column + 16] if importance is not None
+            else torch.ones_like(values)
+        )
+        losses = []
+        for scale in (left, right):
+            normalized = values / scale
+            a = normalized.abs()
+            q = torch.where(a > 5, 6, torch.where(
+                a >= 3.5, 4, torch.where(a >= 1.75, a.round(), (a * 2).round() * .5)
+            )) * normalized.sign()
+            losses.append(((q * scale - values).square() * weights).mean().item())
+        pair_start = (byte % 8) * 2
+        print(
+            f"row={row} byte={byte} "
+            f"codes={actual[row, byte].item()}/{expected[row, byte].item()} "
+            f"scale_raw={scales.view(torch.uint8)[row, group].item()}/"
+            f"{expected_scales.view(torch.uint8)[row, group].item()} "
+            f"loss={losses} "
+            f"normalized_pair={(values / right)[pair_start:pair_start+2].tolist()}",
+            flush=True,
+        )
+
+
 @torch.no_grad()
 def validate_runtime():
     """Check packing, real WMSE, CUTLASS output, loading, and CUDA Graph replay."""
@@ -216,6 +254,9 @@ def validate_runtime():
                 x, global_scale, importance, weighted
             )
             expected, expected_scales, _ = reference_quantize(x, global_scale, importance)
+            if (not torch.equal(actual, expected) or
+                    not torch.equal(scales.view(torch.uint8), expected_scales.view(torch.uint8))):
+                _report_mismatch(x, global_scale, importance, actual, scales, expected, expected_scales)
             assert torch.equal(actual, expected), f"FP4 packing mismatch: {weighted}, {rows}"
             assert torch.equal(scales.view(torch.uint8), expected_scales.view(torch.uint8)), (
                 f"FP8 scale mismatch: {weighted}, {rows}"
