@@ -30,6 +30,20 @@ from vllm.model_executor.layers.quantization.qutlass_utils import to_blocked
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
+from vllm.model_executor.layers.quantization.utils.scalesweep import (
+    scalesweep_quantize, scalesweep_quantize_fake,
+)
+
+
+def _load_scalesweep_importance(param, loaded_weight, shard_id=None):
+    """Whole input-channel vector shared by fused QKV and gate/up shards."""
+    value = loaded_weight.to(device=param.device, dtype=torch.float32).reshape(-1)
+    if value.shape != param.shape:
+        raise ValueError("ScaleSweep importance width does not match this layer.")
+    if getattr(param, "_scalesweep_loaded", False) and not torch.equal(param.data, value):
+        raise ValueError("Fused ScaleSweep shards have different activation importance.")
+    param.data.copy_(value)
+    param._scalesweep_loaded = True
 
 
 class FPQuantConfig(QuantizationConfig):
@@ -43,6 +57,7 @@ class FPQuantConfig(QuantizationConfig):
         lss_identity_transform: bool = False,
         pseudoquantization: bool = False,
         modules_to_not_convert: Optional[list[str]] = None,
+        scalesweep_identity_transform: bool = False,
     ) -> None:
         super().__init__()
         self.hadamard_group_size = hadamard_group_size
@@ -51,6 +66,7 @@ class FPQuantConfig(QuantizationConfig):
         self.lss_identity_transform = lss_identity_transform
         self.pseudoquantization = pseudoquantization
         self.modules_to_not_convert = modules_to_not_convert
+        self.scalesweep_identity_transform = scalesweep_identity_transform
 
         if pseudoquantization:
             raise ValueError("Pseudoquantization is not supported for vLLM")
@@ -63,6 +79,12 @@ class FPQuantConfig(QuantizationConfig):
                 "LSS runtime quantization currently supports only NVFP4, "
                 "group size 16, and an identity transform."
             )
+        if forward_method.startswith("scalesweep_") and (
+            forward_method not in {"scalesweep_mse", "scalesweep_wmse"}
+            or forward_dtype != "nvfp4" or hadamard_group_size != 16
+            or not scalesweep_identity_transform
+        ):
+            raise ValueError("ScaleSweep supports NVFP4 group-16 identity-transform checkpoints.")
 
     def __repr__(self) -> str:
         return (
@@ -70,6 +92,7 @@ class FPQuantConfig(QuantizationConfig):
             f"forward_dtype={self.forward_dtype}, "
             f"forward_method={self.forward_method}, "
             f"lss_identity_transform={self.lss_identity_transform}, "
+            f"scalesweep_identity_transform={self.scalesweep_identity_transform}, "
             f"pseudoquantization={self.pseudoquantization}, "
             f"modules_to_not_convert={self.modules_to_not_convert})"
         )
@@ -95,6 +118,12 @@ class FPQuantConfig(QuantizationConfig):
         hadamard_group_size = cls.get_from_keys(config, ["hadamard_group_size"])
         forward_dtype = cls.get_from_keys(config, ["forward_dtype"])
         forward_method = cls.get_from_keys(config, ["forward_method"])
+        if forward_method in {"scalesweep_mse", "scalesweep_wmse"}:
+            expected_lower = -8 if forward_method == "scalesweep_wmse" else -3
+            if (config.get("scalesweep_base_rounding", "floor") != "floor"
+                    or config.get("scalesweep_lower_bound", expected_lower) != expected_lower
+                    or config.get("scalesweep_upper_bound", 7) != 7):
+                raise ValueError("Checkpoint ScaleSweep search settings do not match this runtime.")
         lss_identity_transform = config.get("lss_identity_transform", False)
         pseudoquantization = cls.get_from_keys(config, ["pseudoquantization"])
         modules_to_not_convert = cls.get_from_keys(config, ["modules_to_not_convert"])
@@ -105,6 +134,7 @@ class FPQuantConfig(QuantizationConfig):
             lss_identity_transform,
             pseudoquantization,
             modules_to_not_convert,
+            scalesweep_identity_transform=config.get("scalesweep_identity_transform", False),
         )
 
     def get_quant_method(
@@ -145,6 +175,10 @@ class FPQuantLinearMethod(LinearMethodBase):
 
         if params_dtype != torch.bfloat16:
             raise ValueError("Only bfloat16 is currently supported by FPQuant")
+        if self.quant_config.forward_method.startswith("scalesweep_"):
+            from vllm.distributed import get_tensor_model_parallel_world_size
+            if get_tensor_model_parallel_world_size() != 1:
+                raise ValueError("ScaleSweep FPQuant currently supports tensor_parallel_size=1.")
         if input_size_per_partition % self.quant_config.hadamard_group_size != 0:  # noqa: E501
             raise ValueError(
                 "The input size is not aligned with the quantized "
@@ -221,6 +255,15 @@ class FPQuantLinearMethod(LinearMethodBase):
             act_global_scale, {"ignore_warning": True} | extra_weight_attrs
         )
         layer.register_parameter("act_global_scale", act_global_scale)
+        if self.quant_config.forward_method == "scalesweep_wmse":
+            importance = Parameter(
+                torch.full((input_size_per_partition,), float("nan"), dtype=torch.float32),
+                requires_grad=False,
+            )
+            set_weight_attrs(importance, {
+                **extra_weight_attrs, "weight_loader": _load_scalesweep_importance,
+            })
+            layer.register_parameter("act_importance", importance)
 
         forward_hadamard_matrix = Parameter(
             torch.empty(
@@ -270,6 +313,18 @@ class FPQuantLinearMethod(LinearMethodBase):
         # Set to True by Qwen2Model.load_weights only when a checkpoint
         # actually contains input_perm/input_rescale.
         layer.input_transform_enabled = False
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.quant_config.forward_method.startswith("scalesweep_"):
+            for name in ("weight_global_scale", "act_global_scale"):
+                scale = getattr(layer, name)
+                if not torch.isfinite(scale).all() or not (scale > 0).all():
+                    raise ValueError(f"Invalid ScaleSweep checkpoint {name}.")
+        if self.quant_config.forward_method == "scalesweep_wmse":
+            importance = layer.act_importance
+            if (not getattr(importance, "_scalesweep_loaded", False)
+                    or not torch.isfinite(importance).all() or (importance < 0).any()):
+                raise ValueError("ScaleSweep-WMSE checkpoint is missing valid act_importance.")
 
     def apply(
         self,
@@ -328,6 +383,7 @@ class FPQuantLinearMethod(LinearMethodBase):
             self.quant_config.forward_dtype,
             layer.input_perm if use_fused_lss_input_transform else None,
             layer.input_rescale if use_fused_lss_input_transform else None,
+            getattr(layer, "act_importance", None),
         )
 
 
@@ -558,6 +614,14 @@ direct_register_custom_op(
     dispatch_key=current_platform.dispatch_key,
 )
 
+direct_register_custom_op(
+    op_name="nvfp4_scalesweep_quant",
+    op_func=scalesweep_quantize,
+    mutates_args=[],
+    fake_impl=scalesweep_quantize_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
 
 direct_register_custom_op(
     op_name="nvfp4_lss_quant_permute_scale",
@@ -614,6 +678,7 @@ def quantized_forward(
     forward_dtype: str,
     input_perm: Optional[torch.Tensor] = None,
     input_rescale: Optional[torch.Tensor] = None,
+    act_importance: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     x_flat = x.contiguous().flatten(end_dim=-2)
 
@@ -645,6 +710,11 @@ def quantized_forward(
                         x_flat, input_perm, input_rescale, act_global_scale
                     )
                 )
+        elif forward_method in {"scalesweep_mse", "scalesweep_wmse"}:
+            x_flat_q, x_flat_scales = torch.ops.vllm.nvfp4_scalesweep_quant(
+                x_flat, act_global_scale, act_importance,
+                forward_method == "scalesweep_wmse",
+            )
         else:
             raise ValueError(f"Unsupported NVFP4 forward_method: {forward_method}")
         y = torch.ops.vllm.matmul_nvf4_bf16(
