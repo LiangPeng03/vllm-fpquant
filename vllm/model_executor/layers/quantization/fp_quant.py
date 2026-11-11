@@ -326,6 +326,20 @@ class FPQuantLinearMethod(LinearMethodBase):
             if (not getattr(importance, "_scalesweep_loaded", False)
                     or not torch.isfinite(importance).all() or (importance < 0).any()):
                 raise ValueError("ScaleSweep-WMSE checkpoint is missing valid act_importance.")
+        # Method-independent deployment optimization. Cache only immutable
+        # checkpoint data; activation quantization and transforms stay intact.
+        # Opt-in preserves the previously validated legacy path as a reference.
+        layer._fpquant_prepack_enabled = False
+        if (os.getenv("VLLM_FPQUANT_SHARED_PREPACK", "0") == "1"
+                and self.quant_config.forward_dtype == "nvfp4"):
+            blocked_scales, alpha = prepare_nvfp4_static(
+                layer.scales, layer.weight_global_scale,
+                layer.act_global_scale, layer.qweight.shape[1] // 8,
+            )
+            layer.register_buffer("_fpquant_blocked_scales", blocked_scales,
+                                  persistent=False)
+            layer.register_buffer("_fpquant_alpha", alpha, persistent=False)
+            layer._fpquant_prepack_enabled = True
         layer._nada_fast_enabled = False
         if (os.getenv("VLLM_FPQUANT_NADA_FAST", "0") == "1"
                 and self.quant_config.forward_dtype == "nvfp4"
@@ -338,11 +352,17 @@ class FPQuantLinearMethod(LinearMethodBase):
                 raise RuntimeError("The compiled vLLM extension needs the fused NADA CUTLASS-layout operator.")
             if layer.qweight.shape[1] * 2 % 64 or layer.qweight.shape[0] % 32:
                 raise ValueError("NADA fast inference requires input width divisible by 64 and output width by 32.")
-            groups = layer.qweight.shape[1] // 8
+            if layer._fpquant_prepack_enabled:
+                blocked_scales = layer._fpquant_blocked_scales
+                alpha = layer._fpquant_alpha
+            else:
+                blocked_scales, alpha = prepare_nvfp4_static(
+                    layer.scales, layer.weight_global_scale,
+                    layer.act_global_scale, layer.qweight.shape[1] // 8,
+                )
             layer.register_buffer(
                 "_nada_fast_scales",
-                to_blocked(layer.scales.view(torch.float8_e4m3fn), backend="triton")
-                .view(torch.float8_e4m3fn).reshape(-1, groups).contiguous(),
+                blocked_scales,
                 persistent=False,
             )
             layer.register_buffer(
@@ -350,7 +370,7 @@ class FPQuantLinearMethod(LinearMethodBase):
                 persistent=False,
             )
             layer.register_buffer(
-                "_nada_fast_alpha", 1.0 / (layer.weight_global_scale * layer.act_global_scale),
+                "_nada_fast_alpha", alpha,
                 persistent=False,
             )
             layer._nada_fast_enabled = True
@@ -420,6 +440,10 @@ class FPQuantLinearMethod(LinearMethodBase):
             layer.input_perm if use_fused_lss_input_transform else None,
             layer.input_rescale if use_fused_lss_input_transform else None,
             getattr(layer, "act_importance", None),
+            (layer._fpquant_blocked_scales
+             if getattr(layer, "_fpquant_prepack_enabled", False) else None),
+            (layer._fpquant_alpha
+             if getattr(layer, "_fpquant_prepack_enabled", False) else None),
         )
 
 
@@ -668,6 +692,16 @@ direct_register_custom_op(
 )
 
 
+def prepare_nvfp4_static(weight_scales, weight_global_scale, act_global_scale, groups):
+    """Prepack immutable scales for every NVFP4 method, without changing Q/DQ."""
+    blocked = (
+        to_blocked(weight_scales.view(torch.float8_e4m3fn), backend="triton")
+        .view(torch.float8_e4m3fn).reshape(-1, groups).contiguous()
+    )
+    alpha = 1.0 / (weight_global_scale * act_global_scale)
+    return blocked, alpha
+
+
 def matmul_nvf4_bf16(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -696,6 +730,28 @@ def matmul_nvf4_bf16_fake(x, w, xs, ws, alpha):
 direct_register_custom_op(
     op_name="matmul_nvf4_bf16",
     op_func=matmul_nvf4_bf16,
+    mutates_args=[],
+    fake_impl=matmul_nvf4_bf16_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
+def matmul_nvf4_bf16_prepacked(
+    x: torch.Tensor, w: torch.Tensor, xs: torch.Tensor,
+    blocked_ws: torch.Tensor, alpha: torch.Tensor,
+) -> torch.Tensor:
+    """Same CUTLASS GEMM as legacy; convert only the changing activation scales."""
+    return cutlass_scaled_fp4_mm(
+        x, w,
+        to_blocked(xs, backend="triton").view(torch.float8_e4m3fn)
+        .view(-1, x.shape[1] // 8),
+        blocked_ws, alpha, torch.bfloat16,
+    )
+
+
+direct_register_custom_op(
+    op_name="matmul_nvf4_bf16_prepacked",
+    op_func=matmul_nvf4_bf16_prepacked,
     mutates_args=[],
     fake_impl=matmul_nvf4_bf16_fake,
     dispatch_key=current_platform.dispatch_key,
@@ -752,6 +808,8 @@ def quantized_forward(
     input_perm: Optional[torch.Tensor] = None,
     input_rescale: Optional[torch.Tensor] = None,
     act_importance: Optional[torch.Tensor] = None,
+    blocked_weight_scales: Optional[torch.Tensor] = None,
+    precomputed_alpha: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     x_flat = x.contiguous().flatten(end_dim=-2)
 
@@ -790,13 +848,18 @@ def quantized_forward(
             )
         else:
             raise ValueError(f"Unsupported NVFP4 forward_method: {forward_method}")
-        y = torch.ops.vllm.matmul_nvf4_bf16(
-            x_flat_q,
-            qweight,
-            x_flat_scales,
-            weight_scales,
-            1 / (weight_global_scale * act_global_scale),
-        )
+        if blocked_weight_scales is not None:
+            if precomputed_alpha is None:
+                raise ValueError("Prepacked NVFP4 scales require a precomputed alpha")
+            y = torch.ops.vllm.matmul_nvf4_bf16_prepacked(
+                x_flat_q, qweight, x_flat_scales,
+                blocked_weight_scales, precomputed_alpha,
+            )
+        else:
+            y = torch.ops.vllm.matmul_nvf4_bf16(
+                x_flat_q, qweight, x_flat_scales, weight_scales,
+                1 / (weight_global_scale * act_global_scale),
+            )
     else:
         raise ValueError(f"Unsupported forward_dtype: {forward_dtype}")
 
