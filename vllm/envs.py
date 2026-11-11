@@ -115,6 +115,9 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
+    VLLM_FPQUANT_NADA_FAST: bool = False
+    VLLM_FPQUANT_TORCH_REFERENCE: bool = False
+    VLLM_FPQUANT_TORCH_REFERENCE_SPLIT: bool = False
     Q_SCALE_CONSTANT: int = 200
     K_SCALE_CONSTANT: int = 200
     V_SCALE_CONSTANT: int = 100
@@ -942,6 +945,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DISABLE_COMPILE_CACHE": lambda: bool(
         int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", "0"))
     ),
+    # These switches change FPQuant graph inputs, custom ops, or output splits.
+    "VLLM_FPQUANT_NADA_FAST": lambda: os.getenv("VLLM_FPQUANT_NADA_FAST", "0") == "1",
+    "VLLM_FPQUANT_TORCH_REFERENCE": lambda: os.getenv("VLLM_FPQUANT_TORCH_REFERENCE", "0") == "1",
+    "VLLM_FPQUANT_TORCH_REFERENCE_SPLIT": lambda: os.getenv("VLLM_FPQUANT_TORCH_REFERENCE_SPLIT", "0") == "1",
     # If set, vllm will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
@@ -1411,6 +1418,9 @@ def compute_hash() -> str:
     # for key in environment_variables:
     #     factorize(key)
     environment_variables_to_hash = [
+        "VLLM_FPQUANT_NADA_FAST",
+        "VLLM_FPQUANT_TORCH_REFERENCE",
+        "VLLM_FPQUANT_TORCH_REFERENCE_SPLIT",
         "VLLM_PP_LAYER_PARTITION",
         "VLLM_MLA_DISABLE",
         "VLLM_FLASH_ATTN_MAX_NUM_SPLITS_FOR_CUDA_GRAPH",
