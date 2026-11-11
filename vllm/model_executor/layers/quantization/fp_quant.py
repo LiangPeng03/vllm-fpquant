@@ -17,6 +17,7 @@ from vllm._custom_ops import (
     matmul_mxf4_bf16_tn,
     nvfp4_lss_quant_identity,
     nvfp4_lss_quant_permute_scale,
+    nvfp4_lss_quant_permute_scale_cutlass,
     permute_and_scale_cols,
 )
 from vllm.model_executor.layers.linear import (
@@ -325,6 +326,34 @@ class FPQuantLinearMethod(LinearMethodBase):
             if (not getattr(importance, "_scalesweep_loaded", False)
                     or not torch.isfinite(importance).all() or (importance < 0).any()):
                 raise ValueError("ScaleSweep-WMSE checkpoint is missing valid act_importance.")
+        layer._nada_fast_enabled = False
+        if (os.getenv("VLLM_FPQUANT_NADA_FAST", "0") == "1"
+                and self.quant_config.forward_dtype == "nvfp4"
+                and self.quant_config.forward_method == "lss"
+                and self.quant_config.lss_identity_transform):
+            from vllm.distributed import get_tensor_model_parallel_world_size
+            if get_tensor_model_parallel_world_size() != 1:
+                raise ValueError("NADA fast inference currently supports tensor parallel size 1.")
+            if not hasattr(torch.ops._C, "nvfp4_lss_quant_permute_scale_cutlass"):
+                raise RuntimeError("The compiled vLLM extension needs the fused NADA CUTLASS-layout operator.")
+            if layer.qweight.shape[1] * 2 % 64 or layer.qweight.shape[0] % 32:
+                raise ValueError("NADA fast inference requires input width divisible by 64 and output width by 32.")
+            groups = layer.qweight.shape[1] // 8
+            layer.register_buffer(
+                "_nada_fast_scales",
+                to_blocked(layer.scales.view(torch.float8_e4m3fn), backend="triton")
+                .view(torch.float8_e4m3fn).reshape(-1, groups).contiguous(),
+                persistent=False,
+            )
+            layer.register_buffer(
+                "_nada_fast_perm", layer.input_perm.to(torch.int32).contiguous(),
+                persistent=False,
+            )
+            layer.register_buffer(
+                "_nada_fast_alpha", 1.0 / (layer.weight_global_scale * layer.act_global_scale),
+                persistent=False,
+            )
+            layer._nada_fast_enabled = True
 
     def apply(
         self,
@@ -332,6 +361,13 @@ class FPQuantLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (getattr(layer, "_nada_fast_enabled", False)
+                and os.getenv("VLLM_FPQUANT_TORCH_REFERENCE", "0") != "1"):
+            return torch.ops.vllm.nada_fast_forward(
+                x, layer.qweight, layer._nada_fast_scales,
+                layer._nada_fast_alpha, layer._nada_fast_perm,
+                layer.input_rescale, layer.act_global_scale, bias,
+            )
         # Set once by the model loader after checkpoint loading. Keep this
         # hot path free of tensor-value tests so torch.compile/CUDA Graph can
         # capture both legacy and Ours checkpoints.
@@ -662,6 +698,43 @@ direct_register_custom_op(
     op_func=matmul_nvf4_bf16,
     mutates_args=[],
     fake_impl=matmul_nvf4_bf16_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+
+def nada_fast_forward(
+    x: torch.Tensor, weight: torch.Tensor, blocked_weight_scales: torch.Tensor,
+    alpha: torch.Tensor, perm: torch.Tensor, rescale: torch.Tensor,
+    act_global_scale: torch.Tensor, bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Fused NADA activation quantization directly into the CUTLASS layout."""
+    flat = x.contiguous().flatten(end_dim=-2)
+    values, scales = nvfp4_lss_quant_permute_scale_cutlass(
+        flat, perm, rescale, act_global_scale
+    )
+    # Pass the logical row count to GEMM. The backing buffers remain padded
+    # for the block-scaled layout, including single-token decode.
+    output = cutlass_scaled_fp4_mm(
+        values[:flat.shape[0]], weight,
+        scales.view(-1, flat.shape[1] // 16),
+        blocked_weight_scales, alpha, torch.bfloat16,
+    )
+    output = output.view(*x.shape[:-1], weight.shape[0])
+    return output + bias if bias is not None else output
+
+
+def nada_fast_forward_fake(
+    x: torch.Tensor, weight: torch.Tensor, blocked_weight_scales: torch.Tensor,
+    alpha: torch.Tensor, perm: torch.Tensor, rescale: torch.Tensor,
+    act_global_scale: torch.Tensor, bias: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return torch.empty((*x.shape[:-1], weight.shape[0]),
+                       device=x.device, dtype=torch.bfloat16)
+
+
+direct_register_custom_op(
+    op_name="nada_fast_forward", op_func=nada_fast_forward,
+    mutates_args=[], fake_impl=nada_fast_forward_fake,
     dispatch_key=current_platform.dispatch_key,
 )
 
