@@ -33,7 +33,7 @@ def _fp4(value):
 
 
 @triton.jit
-def _pack_pair(low, high):
+def _pack_pair(low, high, PRESERVE_ZERO_SIGN: tl.constexpr = False):
     packed = tl.inline_asm_elementwise(
         asm="""
         {
@@ -45,9 +45,71 @@ def _pack_pair(low, high):
         constraints="=r,f,f", args=[low, high], dtype=tl.uint32,
         is_pure=True, pack=1,
     )
+    if PRESERVE_ZERO_SIGN:
+        # Match native ABSO encode_fp4, including small negative inputs that
+        # round to zero; an exact input -0 compares nonnegative there.
+        packed = tl.where((packed & 7) == 0,
+                          (packed & 240) | tl.where(low < 0, 8, 0), packed)
+        return tl.where(((packed >> 4) & 7) == 0,
+                        (packed & 15) | tl.where(high < 0, 128, 0), packed)
     # The MR-GPTQ packer canonicalizes both signed zeros to code 0.
     packed = tl.where((packed & 15) == 8, packed & 240, packed)
     return tl.where((packed >> 4) == 8, packed & 15, packed)
+
+
+@triton.jit
+def _abso_fused(X, Global, Packed, Scales, group_count, groups_per_row,
+                padded_groups, BLOCKS: tl.constexpr):
+    """ABSO scale + FP4 pack in one kernel, retaining native BF16 boundaries."""
+    group = tl.program_id(0) * BLOCKS + tl.arange(0, BLOCKS)
+    channel = tl.arange(0, 16)
+    values = tl.load(X + group[:, None] * 16 + channel[None, :],
+                     mask=group[:, None] < group_count, other=0).to(tl.float32)
+    inverse = tl.load(Global).to(tl.float32)
+    a = tl.abs(values)
+    initial = tl.div_rn(tl.max(a, 1), 6.0).to(tl.bfloat16).to(tl.float32)
+    safe = tl.where(initial == 0, 1.0, initial)
+    normalized = tl.div_rn(a, safe[:, None]).to(tl.bfloat16).to(tl.float32)
+    grid = _fp4(normalized)
+    numerator = tl.sum((a * grid).to(tl.bfloat16).to(tl.float32), 1).to(tl.bfloat16).to(tl.float32)
+    denominator = tl.sum((grid * grid).to(tl.bfloat16).to(tl.float32), 1).to(tl.bfloat16).to(tl.float32)
+    estimate = tl.div_rn(numerator, tl.where(denominator == 0, 1.0, denominator)).to(tl.bfloat16).to(tl.float32)
+    raw = tl.minimum(tl.maximum(tl.where(denominator == 0, initial, estimate) * inverse, 0.0), 448.0).to(tl.float8e4nv)
+    physical = tl.div_rn(raw.to(tl.float32), inverse).to(tl.bfloat16).to(tl.float32)
+    physical = tl.where(physical == 0, 1.0, physical)
+    normalized = tl.div_rn(values, physical[:, None]).to(tl.bfloat16).to(tl.float32)
+    pairs = tl.reshape(normalized, (BLOCKS, 8, 2))
+    component = tl.arange(0, 2)
+    # Sum would erase negative zero, but native uses a numerical <0 sign test,
+    # so both signed exact zeros intentionally produce a positive-zero nibble.
+    low = tl.sum(tl.where(component[None, None, :] == 0, pairs, 0.0), 2)
+    high = tl.sum(tl.where(component[None, None, :] == 1, pairs, 0.0), 2)
+    tl.store(Packed + group[:, None] * 8 + tl.arange(0, 8)[None, :],
+             _pack_pair(low, high, PRESERVE_ZERO_SIGN=True).to(tl.uint8),
+             mask=group[:, None] < group_count)
+    row, column = group // groups_per_row, group % groups_per_row
+    tl.store(Scales + row * padded_groups + column,
+             raw.to(tl.uint8, bitcast=True), mask=group < group_count)
+
+
+def abso_fused_quantize(x: torch.Tensor, global_scale: torch.Tensor):
+    """Benchmark-only pure ABSO: no permutation, rescaling or GEMM."""
+    if (x.ndim != 2 or not x.is_cuda or not x.is_contiguous()
+            or x.dtype != torch.bfloat16 or x.shape[1] % 16):
+        raise ValueError("Fused ABSO requires contiguous CUDA BF16 [M,K], K divisible by 16")
+    if (global_scale.dtype != torch.float32 or global_scale.numel() != 1
+            or not global_scale.is_contiguous() or global_scale.device != x.device):
+        raise ValueError("Fused ABSO requires a contiguous CUDA FP32 global scale")
+    rows, width = x.shape
+    groups = width // 16
+    packed = torch.empty((rows, width // 2), device=x.device, dtype=torch.uint8)
+    scales = torch.zeros(((rows + 127) // 128 * 128, (groups + 3) // 4 * 4),
+                         device=x.device, dtype=torch.float8_e4m3fn)
+    if rows:
+        _abso_fused[(triton.cdiv(rows * groups, 16),)](
+            x, global_scale, packed, scales.view(torch.uint8), rows * groups,
+            groups, scales.shape[1], BLOCKS=16, num_warps=4, enable_fp_fusion=False)
+    return packed, scales
 
 
 @triton.jit
