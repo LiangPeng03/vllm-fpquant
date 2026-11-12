@@ -54,10 +54,11 @@ def _pack_pair(low, high):
 def _quantize(
     X, Global, Importance, Packed, Scales, group_count, groups_per_row,
     padded_groups, WEIGHTED: tl.constexpr, BLOCKS: tl.constexpr,
+    MODE: tl.constexpr = 0,
 ):
     group = tl.program_id(0) * BLOCKS + tl.arange(0, BLOCKS)
     channel = tl.arange(0, 16)
-    candidate = tl.arange(0, 16)
+    candidate = tl.arange(0, 2 if MODE == 2 else 16)
     values = tl.load(
         X + group[:, None] * 16 + channel[None, :],
         mask=group[:, None] < group_count, other=0,
@@ -70,9 +71,17 @@ def _quantize(
     base_raw = tl.where(exponent > 0, (exponent << 3) + mantissa,
                         tl.floor(base * 512.0).to(tl.int32))
     base_raw = tl.minimum(tl.maximum(base_raw, 0), 126)
-    lower = -8 if WEIGHTED else -3
+    if MODE == 1:
+        base_raw = base.to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.int32)
+    lower = -2 if MODE == 1 else (-8 if WEIGHTED else -3)
     offsets = candidate + lower
     raw = tl.minimum(tl.maximum(base_raw[:, None] + offsets[None, :], 1), 126)
+    if MODE == 2:
+        divisor = tl.where(candidate == 0, 6.0, 4.0)
+        maximum = tl.max(tl.abs(values), axis=1)
+        unrounded = tl.where(maximum[:, None] > 0, tl.div_rn(maximum[:, None], divisor[None, :]), 1.0)
+        raw = tl.minimum(unrounded * inverse, 448.0).to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.int32)
+        raw = tl.where(raw == 0, tl.minimum(inverse, 448.0).to(tl.float8e4nv).to(tl.uint8, bitcast=True).to(tl.int32), raw)
     scale_exp, scale_man = raw >> 3, raw & 7
     fp32 = ((scale_exp + 120) << 23) | (scale_man << 20)
     decoded = tl.where(scale_exp > 0, fp32.to(tl.float32, bitcast=True),
@@ -88,7 +97,11 @@ def _quantize(
         ).to(tl.float32)
         error = error * importance[:, :, None]
     loss = tl.sum(error, axis=1) / 16.0
-    loss = tl.where(offsets[None, :] <= 7, loss, float("inf"))
+    if MODE == 1:
+        valid = (offsets[None, :] <= 6) & (base_raw[:, None] + offsets[None, :] >= 1) & (base_raw[:, None] + offsets[None, :] <= 126)
+        loss = tl.where(valid, loss, float("inf"))
+    elif MODE == 0:
+        loss = tl.where(offsets[None, :] <= 7, loss, float("inf"))
     minimum = tl.min(loss, axis=1)
     winner = tl.min(tl.where(loss == minimum[:, None], candidate[None, :], 16), axis=1)
     selected_raw = tl.sum(tl.where(candidate[None, :] == winner[:, None], raw, 0), axis=1)
@@ -112,7 +125,7 @@ def _quantize(
 
 def scalesweep_quantize(
     x: torch.Tensor, global_scale: torch.Tensor,
-    importance: Optional[torch.Tensor], weighted: bool,
+    importance: Optional[torch.Tensor], weighted: bool, mode: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (x.ndim != 2 or not x.is_cuda or not x.is_contiguous()
             or x.dtype != torch.bfloat16 or x.shape[1] % 16):
@@ -126,6 +139,8 @@ def scalesweep_quantize(
         or importance.ndim != 1 or importance.numel() != x.shape[1]
     ):
         raise ValueError("WMSE requires the checkpoint's CUDA FP32 channel importance.")
+    if mode not in (0, 1, 2) or (weighted and mode != 0):
+        raise ValueError("Invalid controlled quantization benchmark mode")
     rows, width = x.shape
     groups = width // 16
     packed = torch.empty((rows, width // 2), device=x.device, dtype=torch.uint8)
@@ -138,12 +153,12 @@ def scalesweep_quantize(
     _quantize[(triton.cdiv(rows * groups, 16),)](
         x, global_scale, importance if weighted else x,
         packed, scales.view(torch.uint8), rows * groups, groups, scales.shape[1],
-        WEIGHTED=weighted, BLOCKS=16, num_warps=4, enable_fp_fusion=False,
+        WEIGHTED=weighted, BLOCKS=16, MODE=mode, num_warps=4, enable_fp_fusion=False,
     )
     return packed, scales
 
 
-def scalesweep_quantize_fake(x, global_scale, importance, weighted):
+def scalesweep_quantize_fake(x, global_scale, importance, weighted, mode=0):
     rows, width = x.shape
     return (
         torch.empty((rows, width // 2), device=x.device, dtype=torch.uint8),
