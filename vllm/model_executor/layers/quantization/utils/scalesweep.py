@@ -59,7 +59,7 @@ def _pack_pair(low, high, PRESERVE_ZERO_SIGN: tl.constexpr = False):
 
 @triton.jit
 def _abso_fused(X, Global, Packed, Scales, group_count, groups_per_row,
-                padded_groups, BLOCKS: tl.constexpr):
+                padded_groups, BLOCKS: tl.constexpr, ROUNDS: tl.constexpr = 1):
     """ABSO scale + FP4 pack in one kernel, retaining native BF16 boundaries."""
     group = tl.program_id(0) * BLOCKS + tl.arange(0, BLOCKS)
     channel = tl.arange(0, 16)
@@ -68,13 +68,21 @@ def _abso_fused(X, Global, Packed, Scales, group_count, groups_per_row,
     inverse = tl.load(Global).to(tl.float32)
     a = tl.abs(values)
     initial = tl.div_rn(tl.max(a, 1), 6.0).to(tl.bfloat16).to(tl.float32)
-    safe = tl.where(initial == 0, 1.0, initial)
-    normalized = tl.div_rn(a, safe[:, None]).to(tl.bfloat16).to(tl.float32)
-    grid = _fp4(normalized)
-    numerator = tl.sum((a * grid).to(tl.bfloat16).to(tl.float32), 1).to(tl.bfloat16).to(tl.float32)
-    denominator = tl.sum((grid * grid).to(tl.bfloat16).to(tl.float32), 1).to(tl.bfloat16).to(tl.float32)
-    estimate = tl.div_rn(numerator, tl.where(denominator == 0, 1.0, denominator)).to(tl.bfloat16).to(tl.float32)
-    raw = tl.minimum(tl.maximum(tl.where(denominator == 0, initial, estimate) * inverse, 0.0), 448.0).to(tl.float8e4nv)
+    current = initial
+    # Match QuantizationObserver.LSS_3ROUND: recompute codes from each updated
+    # unprojected BF16 scale; E4M3 projection occurs only after the final update.
+    for step in tl.static_range(ROUNDS):
+        safe = tl.where(current == 0, 1.0, current)
+        normalized = tl.div_rn(a, safe[:, None]).to(tl.bfloat16).to(tl.float32)
+        grid = _fp4(normalized)
+        numerator = tl.sum((a * grid).to(tl.bfloat16).to(tl.float32), 1).to(tl.bfloat16).to(tl.float32)
+        denominator = tl.sum((grid * grid).to(tl.bfloat16).to(tl.float32), 1).to(tl.bfloat16).to(tl.float32)
+        estimate = tl.div_rn(numerator, tl.where(denominator == 0, 1.0, denominator)).to(tl.bfloat16).to(tl.float32)
+        if ROUNDS == 1:
+            current = tl.where(denominator == 0, initial, estimate)
+        else:
+            current = tl.where(denominator == 0, 1.0, estimate)
+    raw = tl.minimum(tl.maximum(current * inverse, 0.0), 448.0).to(tl.float8e4nv)
     physical = tl.div_rn(raw.to(tl.float32), inverse).to(tl.bfloat16).to(tl.float32)
     physical = tl.where(physical == 0, 1.0, physical)
     normalized = tl.div_rn(values, physical[:, None]).to(tl.bfloat16).to(tl.float32)
@@ -92,7 +100,7 @@ def _abso_fused(X, Global, Packed, Scales, group_count, groups_per_row,
              raw.to(tl.uint8, bitcast=True), mask=group < group_count)
 
 
-def abso_fused_quantize(x: torch.Tensor, global_scale: torch.Tensor):
+def abso_fused_quantize(x: torch.Tensor, global_scale: torch.Tensor, rounds: int = 1):
     """Benchmark-only pure ABSO: no permutation, rescaling or GEMM."""
     if (x.ndim != 2 or not x.is_cuda or not x.is_contiguous()
             or x.dtype != torch.bfloat16 or x.shape[1] % 16):
@@ -100,6 +108,8 @@ def abso_fused_quantize(x: torch.Tensor, global_scale: torch.Tensor):
     if (global_scale.dtype != torch.float32 or global_scale.numel() != 1
             or not global_scale.is_contiguous() or global_scale.device != x.device):
         raise ValueError("Fused ABSO requires a contiguous CUDA FP32 global scale")
+    if rounds not in (1, 3):
+        raise ValueError("Fused ABSO currently supports 1 or 3 scale updates")
     rows, width = x.shape
     groups = width // 16
     packed = torch.empty((rows, width // 2), device=x.device, dtype=torch.uint8)
@@ -108,7 +118,7 @@ def abso_fused_quantize(x: torch.Tensor, global_scale: torch.Tensor):
     if rows:
         _abso_fused[(triton.cdiv(rows * groups, 16),)](
             x, global_scale, packed, scales.view(torch.uint8), rows * groups,
-            groups, scales.shape[1], BLOCKS=16, num_warps=4, enable_fp_fusion=False)
+            groups, scales.shape[1], BLOCKS=16, ROUNDS=rounds, num_warps=4, enable_fp_fusion=False)
     return packed, scales
 
 
